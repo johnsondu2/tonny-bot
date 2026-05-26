@@ -35,6 +35,8 @@ sleep 1
 echo "Launching RViz..."
 gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; ros2 launch turtlebot4_viz view_robot.launch.py namespace:=/$TB; exec bash"
 
+sleep 2
+
 echo "Launching teleop..."
 gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/$TB/cmd_vel; exec bash"
 
