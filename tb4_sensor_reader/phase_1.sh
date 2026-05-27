@@ -21,6 +21,8 @@ echo "Using TurtleBot: $TB"
 # Optional automatic setup
 set-turtlebot $TB_NUM
 
+sleep 1
+
 echo "Undocking..."
 
 ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
