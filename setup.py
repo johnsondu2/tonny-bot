@@ -35,6 +35,7 @@ setup(
 		    'camera_viewer = tb4_sensor_reader.camera_viewer:main',
 		    'camera_detector = tb4_sensor_reader.camera_detector:main',
 		    'detect_and_stop = tb4_sensor_reader.detect_and_stop:main',
+		    'autonomous_search = tb4_sensor_reader.autonomous_search:main',
     	],
 	},
 )
