@@ -68,7 +68,7 @@ ros2 action send_goal /$TB/dock irobot_create_msgs/action/Dock "{}"
 sleep 1
 
 ros2 run nav2_map_server map_saver_cli \
--f ~/Desktop/demo_map \
+-f ~/Desktop/map/map \
 --ros-args -r map:=/$TB/map
 
 echo "Map saved!"
@@ -77,6 +77,6 @@ echo "Saving SLAM pose graph..."
 
 ros2 service call /$TB/slam_toolbox/serialize_map \
 slam_toolbox/srv/SerializePoseGraph \
-"{filename: '$HOME/Desktop/demo_map'}"
+"{filename: '$HOME/Desktop/map/map'}"
 
 echo "DONE: Map + pose graph saved to Desktop"
