@@ -2,13 +2,12 @@ import rclpy, math
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
-from nav_msgs.msg import Odometry
 
-NAMESPACE      = '/T18'
-FORWARD_SPEED  = 0.15
-TURN_SPEED     = 0.8
-AVOID_DISTANCE = 0.55
-FRONT_ARC_DEG  = 60
+NAMESPACE      = '/T29'   # ← change to your robot namespace
+FORWARD_SPEED  = 0.15    # m/s
+TURN_SPEED     = 0.5     # rad/s
+AVOID_DISTANCE = 0.55    # metres
+FRONT_ARC_DEG  = 60      # degrees either side of forward
 
 class AvoidancePhysical(Node):
     def __init__(self):
@@ -23,15 +22,6 @@ class AvoidancePhysical(Node):
         self.nearest_right = float('inf')
         self.timer = self.create_timer(0.1, self.control_loop)
         self.get_logger().info('Avoidance controller started')
-
-        self.current_x = 0.0
-        self.current_y = 0.0
-        self.create_subscription(
-            Odometry,
-            f'{NAMESPACE}/odom',
-            self.odom_callback,
-            10
-        )
 
     def scan_callback(self, msg):
         inc    = msg.angle_increment
@@ -52,12 +42,6 @@ class AvoidancePhysical(Node):
         self.nearest_left  = arc_min(front_i,          front_i + side_a)
         self.nearest_right = arc_min(front_i - side_a, front_i)
 
-    # BUG 1 FIXED: odom_callback was nested inside scan_callback (wrong indentation)
-    def odom_callback(self, msg):
-        self.current_x = msg.pose.pose.position.x
-        # BUG 2 FIXED: incomplete assignment — was just `m` instead of the y position
-        self.current_y = msg.pose.pose.position.y
-
     def control_loop(self):
         msg = Twist()
         if self.nearest_front > AVOID_DISTANCE:
@@ -74,10 +58,6 @@ class AvoidancePhysical(Node):
                 msg.angular.z = -TURN_SPEED
                 self.get_logger().warn('Obstacle — turning RIGHT')
         self.publisher.publish(msg)
-        # BUG 3 FIXED: f-string split across lines — must stay on one line
-        self.get_logger().info(
-            f'Fwd | front={self.nearest_front:.2f} m | pos=({self.current_x:.2f}, {self.current_y:.2f})'
-        )
 
 def main(args=None):
     rclpy.init(args=args)

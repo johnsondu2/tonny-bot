@@ -4,7 +4,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from cv_bridge import CvBridge
 
-NAMESPACE = '/T7'          # ← change to your robot namespace
+NAMESPACE = '/T29'          # ← change to your robot namespace
 
 # HSV thresholds for red — use your Investigation C values
 # Red wraps around hue 0/180, so two ranges are needed
