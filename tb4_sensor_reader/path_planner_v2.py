@@ -1,22 +1,23 @@
 """
-path_planner_v2.py
+map_planner.py
 
-Reads map.pgm + map.yaml from ~/Downloads/map.
+Reads map.pgm + map.yaml from ~/Downloads/map  (saved there by the Phase 1 bash script).
+
 Automatically finds:
   - Robot origin  : world (0,0) derived from the YAML
   - Dead end      : the farthest reachable point through corridor centres
 
 Plans an A* path from origin to dead end, weighted to stay
-as far from walls as possible (follows the brightest/greenest
-cells on the distance transform).
+as far from walls as possible (follows corridor centres using
+a distance-transform cost map).
 
-Outputs:
-  - path_waypoints.csv   : (x_m, y_m) world coordinates
-  - path_output.png      : visualisation
+Can be used two ways:
+  1. Standalone:   python3 map_planner.py
+     → writes path_waypoints.csv + path_output.png to MAP_DIR
 
-Usage:
-    pip install opencv-python pyyaml
-    python3 path_planner_v2.py
+  2. Imported module (used by autonomous_search.py at runtime):
+     from map_planner import load_map, largest_free_region, astar, ...
+     All public functions work independently with no global state.
 """
 
 import cv2
@@ -25,15 +26,16 @@ import yaml
 import heapq
 import csv
 import os
-# ── Config ────────────────────────────────────────────────────────────────────
-MAP_DIR   = os.path.expanduser("~/Downloads/map")
-PGM_FILE  = os.path.join(MAP_DIR, "map.pgm")
+
+# ── Standalone config (only used when run as __main__) ────────────────────────
+MAP_DIR  = os.path.expanduser("~/Downloads/map")
+PGM_FILE = os.path.join(MAP_DIR, "map.pgm")
 YAML_FILE = os.path.join(MAP_DIR, "map.yaml")
-OUT_CSV   = os.path.join(MAP_DIR, "path_waypoints.csv")
-OUT_IMG   = os.path.join(MAP_DIR, "path_output.png")
+OUT_CSV  = os.path.join(MAP_DIR, "path_waypoints.csv")
+OUT_IMG  = os.path.join(MAP_DIR, "path_output.png")
 
 # How strongly to prefer corridor centres vs raw distance.
-# Higher = tighter centre-hugging. 5.0 works well for most arenas.
+# Higher = tighter centre-hugging. 25.0 works well for most arenas.
 CENTRE_WEIGHT = 25.0
 
 # Waypoint spacing: keep every Nth cell (N * resolution = metres between waypoints).
@@ -44,95 +46,129 @@ WAYPOINT_STEP = 5
 ENCLOSURE_BONUS = 5.0
 
 
-# ── Load map ──────────────────────────────────────────────────────────────────
+# ── Map loading ───────────────────────────────────────────────────────────────
+
 def load_map(pgm_path, yaml_path):
+    """
+    Load a ROS 2 nav2 map from its .pgm image and .yaml metadata files.
+
+    Returns:
+        free_grid   : (H, W) uint8 array — 1 = free cell, 0 = obstacle/unknown
+        resolution  : metres per pixel (e.g. 0.05)
+        origin      : [x, y, theta] real-world coordinates of bottom-left pixel
+        raw_img     : (H, W) uint8 original grayscale image (for visualisation)
+    """
     with open(yaml_path) as f:
         meta = yaml.safe_load(f)
 
-    resolution = meta["resolution"]
-    origin     = meta["origin"]          # [x, y, theta] — bottom-left of image
+    resolution  = meta["resolution"]
+    origin      = meta["origin"]           # [x, y, theta] of bottom-left corner
     free_thresh = meta.get("free_thresh", 0.25)
     negate      = meta.get("negate", 0)
 
     img = cv2.imread(pgm_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise FileNotFoundError(f"Cannot read {pgm_path}")
+        raise FileNotFoundError(f"Cannot read map image: {pgm_path}")
 
+    # Convert pixel intensity to occupancy probability.
+    # In a ROS .pgm map: white (255) = free, black (0) = occupied.
     prob = img.astype(float) / 255.0
     if negate:
         prob = 1.0 - prob
 
+    # Mark cells as free only if their probability exceeds the free threshold.
+    # Cells below occupied_thresh are obstacles; between thresholds = unknown.
     free_grid = (prob >= (1.0 - free_thresh)).astype(np.uint8)
     return free_grid, resolution, origin, img
 
 
-# ── Main navigable region ─────────────────────────────────────────────────────
+# ── Navigable region ──────────────────────────────────────────────────────────
+
 def largest_free_region(free_grid):
+    """
+    Find the largest connected component of free cells using 8-connectivity.
+    This eliminates isolated free patches outside the navigable arena and
+    ensures A* only plans within the main reachable area.
+
+    Returns a (H, W) uint8 binary mask — 1 inside the region, 0 outside.
+    """
     num_labels, labeled, stats, _ = cv2.connectedComponentsWithStats(
-        free_grid.astype(np.uint8), connectivity=8
-    )
+        free_grid.astype(np.uint8), connectivity=8)
     if num_labels <= 1:
-        raise RuntimeError("No free space found in map.")
-    # skip label 0 (background); find largest non-background region
+        raise RuntimeError("No free space found in map — check pgm/yaml files.")
+    # Label 0 is background; find the largest non-background label by area.
     largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     return (labeled == largest).astype(np.uint8)
 
 
-# ── Coordinate helpers ────────────────────────────────────────────────────────
+# ── Coordinate conversion ─────────────────────────────────────────────────────
+
 def world_to_pixel(wx, wy, origin, resolution, img_height):
-    """World metres → (row, col) pixel. Y axis is flipped (image top = world max-Y)."""
+    """
+    Convert real-world (x, y) metres to map pixel (row, col).
+
+    The map image has row 0 at the top, but ROS world Y increases upward,
+    so the row is flipped: row = img_height - row_from_bottom.
+    """
     col = int(round((wx - origin[0]) / resolution))
     row = img_height - int(round((wy - origin[1]) / resolution))
     return row, col
 
 
 def pixel_to_world(row, col, origin, resolution, img_height):
-    """(row, col) pixel → (wx, wy) world metres."""
+    """
+    Convert map pixel (row, col) to real-world (x, y) metres.
+    Inverse of world_to_pixel.
+    """
     wx = col * resolution + origin[0]
     wy = (img_height - row) * resolution + origin[1]
     return wx, wy
 
 
-# ── Find dead end ─────────────────────────────────────────────────────────────
+# ── Dead-end detection ────────────────────────────────────────────────────────
+
 def find_dead_end(navigable, dist_map, start):
     """
-    Finds the natural corridor terminus — the last high-clearance cell before
+    Find the natural corridor terminus — the last high-clearance cell before
     the corridor closes off.
 
     Strategy:
-      1. Compute the distance-weighted A* cost from start to every reachable cell
-         (Dijkstra). This gives a 'how far along the corridor centre' measure.
-      2. Find all local maxima of the distance transform (cells whose clearance
-         is >= all 8 neighbours). These are the ridge/spine peaks of the corridor.
-      3. Among those peaks, pick the one with the highest Dijkstra cost from start
-         — that is the peak that is deepest into the corridor, which is the dead end.
+      1. Run Dijkstra from start using the distance-transform weighted cost.
+         This gives a 'depth into corridor' measure for every reachable cell.
+      2. Find all local maxima of the distance transform (corridor ridge cells).
+      3. Return the local maximum with the highest Dijkstra cost = deepest into
+         the corridor = the dead end the robot should search toward.
     """
     h, w  = navigable.shape
     dirs8 = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
 
-    # Dijkstra from start along corridor centres (same cost map as A*)
+    # Cost map: cells near walls are expensive, corridor centres are cheap
     cost_map = 1.0 + CENTRE_WEIGHT / (dist_map + 0.5)
     cost_map[navigable == 0] = np.inf
 
+    # Dijkstra from start
     dijkstra = np.full((h, w), np.inf)
     dijkstra[start] = 0.0
     pq = [(0.0, start)]
 
     while pq:
         g, (r, c) = heapq.heappop(pq)
-        if g > dijkstra[r, c]: continue
+        if g > dijkstra[r, c]:
+            continue
         for dr, dc in dirs8:
-            nr, nc = r+dr, c+dc
-            if not (0 <= nr < h and 0 <= nc < w): continue
-            if navigable[nr, nc] == 0: continue
-            step = 1.414 if dr and dc else 1.0
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < h and 0 <= nc < w):
+                continue
+            if navigable[nr, nc] == 0:
+                continue
+            step = 1.414 if (dr and dc) else 1.0
             ng = g + step * cost_map[nr, nc]
             if ng < dijkstra[nr, nc]:
                 dijkstra[nr, nc] = ng
                 heapq.heappush(pq, (ng, (nr, nc)))
 
-    # Find local maxima of the distance transform within navigable space
-    # A cell is a local max if its dist value >= all 8 neighbours
+    # Find local maxima of the distance transform within the navigable region.
+    # A local maximum is a cell whose clearance value is >= all 8 neighbours.
     local_maxima = []
     for r in range(h):
         for c in range(w):
@@ -140,7 +176,7 @@ def find_dead_end(navigable, dist_map, start):
                 continue
             d = dist_map[r, c]
             is_peak = all(
-                not (0 <= r+dr < h and 0 <= c+dc < w and navigable[r+dr,c+dc])
+                not (0 <= r+dr < h and 0 <= c+dc < w and navigable[r+dr, c+dc])
                 or dist_map[r+dr, c+dc] <= d
                 for dr, dc in dirs8
             )
@@ -148,22 +184,27 @@ def find_dead_end(navigable, dist_map, start):
                 local_maxima.append((r, c))
 
     if not local_maxima:
-        # Fallback: just return farthest reachable cell by Dijkstra cost
+        # Fallback: the cell that is hardest to reach from start
         reachable = np.where(navigable == 1, dijkstra, -np.inf)
         return tuple(np.unravel_index(np.argmax(reachable), (h, w)))
 
-    # Pick the local maximum with the highest Dijkstra cost from start
-    # = deepest into the corridor centre
-    dead_end = max(local_maxima, key=lambda rc: dijkstra[rc[0], rc[1]])
-    return dead_end
+    # The deepest local maximum = most expensive to reach = dead end
+    return max(local_maxima, key=lambda rc: dijkstra[rc[0], rc[1]] * (dist_map[rc[0], rc[1]] ** 0.5))
 
 
-# ── A* weighted by wall distance ──────────────────────────────────────────────
+# ── A* path planner ───────────────────────────────────────────────────────────
+
 def astar(navigable, dist_map, start, goal):
     """
-    A* from start to goal.
-    Move cost = step_length * (1 + CENTRE_WEIGHT / (dist_to_wall + 0.5))
-    so the planner naturally stays in the green/bright corridor centre.
+    A* from start to goal on the navigable grid.
+
+    Move cost = step_length × (1 + CENTRE_WEIGHT / (dist_to_wall + 0.5))
+
+    This makes the planner naturally prefer corridor centres (high dist_map values)
+    over paths that graze walls. The resulting path is safer and smoother.
+
+    Returns the path as a list of (row, col) tuples from start to goal,
+    or None if no path exists.
     """
     h, w  = navigable.shape
     dirs8 = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]
@@ -172,9 +213,10 @@ def astar(navigable, dist_map, start, goal):
     cost_map[navigable == 0] = np.inf
 
     def heur(a, b):
+        # Euclidean distance heuristic (admissible for diagonal movement)
         return ((a[0]-b[0])**2 + (a[1]-b[1])**2) ** 0.5
 
-    counter = 0
+    counter = 0  # Tie-breaker to avoid comparing tuples
     pq = [(heur(start, goal), counter, 0.0, start)]
     came_from = {}
     g_score   = {start: 0.0}
@@ -183,6 +225,7 @@ def astar(navigable, dist_map, start, goal):
         _, _, gc, cur = heapq.heappop(pq)
 
         if cur == goal:
+            # Reconstruct path by walking back through came_from
             path = []
             while cur in came_from:
                 path.append(cur)
@@ -192,13 +235,15 @@ def astar(navigable, dist_map, start, goal):
             return path
 
         if gc > g_score.get(cur, 1e18):
-            continue
+            continue  # Stale entry in the priority queue
 
         for dr, dc in dirs8:
             nb = (cur[0]+dr, cur[1]+dc)
-            if not (0 <= nb[0] < h and 0 <= nb[1] < w): continue
-            if navigable[nb[0], nb[1]] == 0: continue
-            step = 1.414 if dr and dc else 1.0
+            if not (0 <= nb[0] < h and 0 <= nb[1] < w):
+                continue
+            if navigable[nb[0], nb[1]] == 0:
+                continue
+            step = 1.414 if (dr and dc) else 1.0
             ng   = g_score[cur] + step * cost_map[nb[0], nb[1]]
             if ng < g_score.get(nb, 1e18):
                 came_from[nb] = cur
@@ -206,35 +251,42 @@ def astar(navigable, dist_map, start, goal):
                 counter += 1
                 heapq.heappush(pq, (ng + heur(nb, goal), counter, ng, nb))
 
-    return None  # no path found
+    return None  # No path found
 
 
-# ── Thin path to waypoints ────────────────────────────────────────────────────
+# ── Path thinning ─────────────────────────────────────────────────────────────
+
 def thin(path, step, start_world, origin, resolution, img_height,
          min_start_dist=0.10):
     """
-    Thin the path to every Nth cell, then:
-      1. Strip any waypoints within min_start_dist of the robot start.
-      2. If the last two waypoints are within min_start_dist of each other,
-         drop the second to last — keeping the final destination intact.
+    Reduce a dense pixel-level path to evenly spaced waypoints.
+
+    Steps:
+      1. Keep every `step`-th cell from the path.
+      2. Always include the final goal cell.
+      3. Strip waypoints within min_start_dist of the robot's start position
+         (they are already behind the robot or too close to matter).
+      4. Merge the last two waypoints if they are within min_start_dist
+         of each other (prevents a micro-step at the very end).
+
+    Returns a list of (row, col) pixel coordinates.
     """
     pts = path[::step]
     if pts[-1] != path[-1]:
-        pts.append(path[-1])
+        pts.append(path[-1])  # Always include the goal
 
-    # Strip waypoints too close to start
+    # Strip waypoints too close to start position
     sx, sy = start_world
     filtered = []
     for r, c in pts:
         wx, wy = pixel_to_world(r, c, origin, resolution, img_height)
-        dist = ((wx - sx)**2 + (wy - sy)**2) ** 0.5
-        if dist >= min_start_dist:
+        if ((wx - sx)**2 + (wy - sy)**2) ** 0.5 >= min_start_dist:
             filtered.append((r, c))
 
     if not filtered:
-        filtered = pts  # fallback
+        filtered = pts  # Fallback: nothing was close enough to strip
 
-    # Drop second to last if too close to final waypoint
+    # Merge last two waypoints if they are very close together
     if len(filtered) >= 2:
         r1, c1 = filtered[-2]
         r2, c2 = filtered[-1]
@@ -246,40 +298,56 @@ def thin(path, step, start_world, origin, resolution, img_height,
     return filtered
 
 
-# ── Visualise ─────────────────────────────────────────────────────────────────
+# ── Visualisation ─────────────────────────────────────────────────────────────
+
 def visualise(navigable, dist_map, path, waypoints, start, goal, out_path):
+    """
+    Save a colour visualisation of the planned path overlaid on the distance
+    transform. Blue = robot origin, green = dead-end goal, cyan dots = waypoints,
+    white pixels = planned path.
+    """
     h, w  = navigable.shape
-    scale = 8
+    scale = 8  # Upscale for visibility
 
     dist_norm = cv2.normalize(dist_map, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
     vis = cv2.applyColorMap(dist_norm, cv2.COLORMAP_WINTER)
-    vis[navigable == 0] = [20, 20, 20]
-    vis = cv2.resize(vis, (w*scale, h*scale), interpolation=cv2.INTER_NEAREST)
+    vis[navigable == 0] = [20, 20, 20]  # Dark grey for obstacles/unknown
+    vis = cv2.resize(vis, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
 
     for r, c in path:
-        vis[r*scale, c*scale] = (255, 255, 255)
+        vis[r * scale, c * scale] = (255, 255, 255)  # White = path
 
     for r, c in waypoints:
-        cv2.circle(vis, (c*scale, r*scale), 4, (0, 220, 220), -1)
+        cv2.circle(vis, (c * scale, r * scale), 4, (0, 220, 220), -1)  # Cyan = waypoints
 
     r0, c0 = start
-    cv2.circle(vis, (c0*scale, r0*scale), 8, (60, 60, 255), -1)
-    cv2.putText(vis, "origin", (c0*scale+8, r0*scale-6),
+    cv2.circle(vis, (c0 * scale, r0 * scale), 8, (60, 60, 255), -1)
+    cv2.putText(vis, "origin", (c0 * scale + 8, r0 * scale - 6),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 255), 1)
 
     rg, cg = goal
-    cv2.circle(vis, (cg*scale, rg*scale), 8, (60, 220, 60), -1)
-    cv2.putText(vis, "dead end", (cg*scale+8, rg*scale+4),
+    cv2.circle(vis, (cg * scale, rg * scale), 8, (60, 220, 60), -1)
+    cv2.putText(vis, "dead end", (cg * scale + 8, rg * scale + 4),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 220, 60), 1)
 
     cv2.imwrite(out_path, vis)
-    print(f"Saved visualisation  →  {out_path}")
+    print(f"Saved visualisation → {out_path}")
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Standalone entry point ────────────────────────────────────────────────────
+
 def main():
+    """
+    Run the path planner as a standalone script.
+    Reads the Phase 1 map from ~/Downloads/map, plans a path, and writes
+    path_waypoints.csv + path_output.png to the same directory.
+
+    This is run after Phase 1 mapping is complete to preview the planned path
+    before Phase 2 begins. The autonomous_search.py node re-runs the same
+    planning at startup, so the CSV is not required by Phase 2.
+    """
     print("=" * 55)
-    print("  Path Planner v2 — automatic dead-end detection")
+    print("  Path Planner — automatic dead-end detection")
     print("=" * 55)
 
     print("\n[1/5] Loading map...")
@@ -297,8 +365,8 @@ def main():
 
     print("\n[3/5] Locating start and dead end...")
     start = world_to_pixel(0.0, 0.0, origin, resolution, h)
-    # Snap to nearest free cell in case origin lands on a wall pixel
     if navigable[start[0], start[1]] == 0:
+        # Snap to nearest free cell if origin lands on a wall pixel
         free_coords = np.argwhere(navigable == 1)
         dists = np.sum((free_coords - np.array(start))**2, axis=1)
         start = tuple(free_coords[np.argmin(dists)])
@@ -317,8 +385,8 @@ def main():
         return
 
     start_world = pixel_to_world(*start, origin, resolution, h)
-    waypoints = thin(path, WAYPOINT_STEP, start_world, origin, resolution, h)
-    world_wps = [pixel_to_world(r, c, origin, resolution, h) for r, c in waypoints]
+    wp_pixels   = thin(path, WAYPOINT_STEP, start_world, origin, resolution, h)
+    world_wps   = [pixel_to_world(r, c, origin, resolution, h) for r, c in wp_pixels]
 
     total_dist = sum(
         ((world_wps[i+1][0]-world_wps[i][0])**2 +
@@ -336,7 +404,7 @@ def main():
         writer.writerows([(f"{x:.4f}", f"{y:.4f}") for x, y in world_wps])
     print(f"      Waypoints CSV →  {OUT_CSV}")
 
-    visualise(navigable, dist_map, path, waypoints, start, goal, OUT_IMG)
+    visualise(navigable, dist_map, path, wp_pixels, start, goal, OUT_IMG)
 
     print("\nFirst 10 waypoints (x, y) metres:")
     for x, y in world_wps[:10]:

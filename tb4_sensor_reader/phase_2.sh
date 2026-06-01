@@ -1,13 +1,16 @@
+#!/bin/bash
 # Before this script runs, the terminals open from Phase 1 must be manually closed.
 # Also, just once on PC startup, run "chmod +x phase_2.sh"
-
-#!/bin/bash
 
 # Source ROS2 environment
 source ~/.bashrc
 source ~/ros2_ws/install/setup.bash
 
-clear 
+# Build the package with the latest code, then re-source
+cd ~/ros2_ws && colcon build --packages-select tb4_sensor_reader
+source ~/ros2_ws/install/setup.bash
+
+clear
 
 # Ask user for TurtleBot number
 read -p "Enter TurtleBot number: " TB_NUM
@@ -17,13 +20,7 @@ TB="T$TB_NUM"
 
 echo "Using TurtleBot: $TB"
 
-# Optional automatic setup
 set-turtlebot $TB_NUM
-
-sleep 1
-
-echo "Undocking..."
-ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
 
 sleep 1
 
@@ -35,4 +32,3 @@ sleep 2
 gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_venv/bin/activate; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; echo ''; read -p 'Press Enter to start autonomous search...' _; ~/ros2_venv/bin/python3 -m tb4_sensor_reader.autonomous_search; exec bash"
 
 echo "Robot is now in autonomous navigation mode."
-

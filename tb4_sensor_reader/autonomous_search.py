@@ -1,661 +1,683 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# IMPORTS
+# autonomous_search.py
 # ─────────────────────────────────────────────────────────────────────────────
-import rclpy, cv2, math, csv, os
+
+import rclpy, cv2, math, os, threading, time
 import numpy as np
 from rclpy.node import Node
-from geometry_msgs.msg import Twist          # Used to send velocity commands to the robot
-from sensor_msgs.msg import LaserScan, CompressedImage  # LiDAR and camera data
-from nav_msgs.msg import Odometry            # Robot position/orientation data
-from rclpy.qos import qos_profile_sensor_data  # QoS preset suited for high-rate sensor topics
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan, CompressedImage
+from nav_msgs.msg import Odometry
+from rclpy.qos import qos_profile_sensor_data
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION CONSTANTS
-# ─────────────────────────────────────────────────────────────────────────────
+from tb4_sensor_reader.path_planner_v2 import (
+    load_map, largest_free_region,
+    world_to_pixel, pixel_to_world,
+    find_dead_end, astar, thin,
+    WAYPOINT_STEP, CENTRE_WEIGHT,
+)
 
-NAMESPACE        = '/T29'    # Robot's ROS 2 namespace — all topic names are prefixed with this
-FORWARD_SPEED    = 0.15      # Linear speed in m/s when driving forward
-TURN_SPEED       = 0.5       # Angular speed in rad/s for turns
-AVOID_DISTANCE   = 0.45      # Stop and turn if an obstacle is within this many metres (front arc)
-FRONT_ARC_DEG    = 60        # Width of the "front danger zone" arc in degrees
-FRONT_OFFSET_DEG = -90.0     # Rotational offset to align the LiDAR's front index with the robot's true forward
-
-WAYPOINT_RADIUS  = 0.1       # Distance (m) at which a waypoint is considered "reached"
-HEADING_TOL      = 0.08      # Heading error in radians considered "close enough" to the target angle
-WAYPOINTS_CSV    = os.path.expanduser('~/Downloads/map/path_waypoints.csv')  # File with the planned search path
-
-# ── Robust avoidance constants (replaces the old fixed AVOID_FWD_SECS) ───────
-# Rather than driving for a fixed time, the robot uses two conditions to decide
-# when it has genuinely cleared an obstacle:
-#
-#   Condition 1 — Side arc clears:
-#     While passing the obstacle, the LiDAR arc on the obstacle's side will
-#     read a short distance. Once the robot passes the edge, that arc opens up
-#     past AVOID_SIDE_CLEAR_M. This is the primary "done" signal.
-#
-#   Condition 2 — Geometric minimum distance:
-#     When the obstacle is first detected, the front arc gives its distance.
-#     The robot must travel at least that distance plus a fixed buffer before
-#     Condition 1 is even checked. This stops the robot from declaring "clear"
-#     too early if it happens to be approaching from an angle.
-#
-#   Condition 3 — Hard cap (fallback):
-#     If the side arc never clears (e.g. the "obstacle" is actually a wall that
-#     runs the full length of the corridor), the robot gives up after
-#     AVOID_MAX_FWD_M metres and re-plans to the next waypoint anyway.
-AVOID_SIDE_CLEAR_M = 0.70   # Side arc distance (m) that signals the obstacle edge has been passed
-AVOID_GEO_BUFFER_M = 0.25   # Extra metres added to the obstacle distance to form the geometric minimum
-AVOID_MAX_FWD_M    = 2.50   # Hard fallback: give up and re-plan after driving this far
-
-# ── Cube detection thresholds ────────────────────────────────────────────────
-CUBE_PIXEL_THRESHOLD = 2000   # Minimum red pixels during the sweep to consider the cube "seen" at that angle
-CUBE_STOP_PIXELS     = 30000  # During final approach, stop when red pixel count reaches this (cube is close)
-CUBE_TURN_SPEED      = 0.2    # Slower turn speed used during the cube-finding sweep and alignment
-CUBE_FWD_SPEED       = 0.08   # Slow forward speed during the final approach to the cube
-SWEEP_DEG            = 180.0  # Total sweep angle in degrees when scanning for the cube
-
-# ── HSV colour ranges for red detection ─────────────────────────────────────
-# Red wraps around the HSV hue axis, so two ranges are needed:
-#   Range 1 covers hue 0–10  (red on the low end of the scale)
-#   Range 2 covers hue 170–180 (red on the high end of the scale)
+NAMESPACE        = '/T21'
+FORWARD_SPEED    = 0.15
+TURN_SPEED       = 0.5
+FRONT_ARC_DEG    = 60
+FRONT_OFFSET_DEG = -90.0
+REPLAN_COOLDOWN_S = 3.0
+MAP_DIR          = os.path.expanduser('~/Downloads/map')
+WAYPOINT_RADIUS  = 0.1
+HEADING_TOL      = 0.08
+EMERGENCY_DIST   = 0.25
+ROBOT_RADIUS_PX  = 3
+REPLAN_NEARBY_M  = 1.5
+REPLAN_LOOKAHEAD = 5
+SCAN_SAMPLE_RATE = 4
+SCAN_MAX_RANGE_M = 4.0
+MIN_NEW_OBS_DIST_PX = 3
+HIT_THRESHOLD       = 3
+MIN_PIXELS           = 500000
+CUBE_PIXEL_THRESHOLD = 2000
+CUBE_STOP_PIXELS     = 30000
+CUBE_TURN_SPEED      = 0.2
+CUBE_FWD_SPEED       = 0.08
+SWEEP_DEG            = 180.0
 RED_LOW1  = np.array([0,   120, 70])
 RED_HIGH1 = np.array([10,  255, 255])
 RED_LOW2  = np.array([170, 120, 70])
 RED_HIGH2 = np.array([180, 255, 255])
-MIN_PIXELS = 500000  # Pixel count that triggers an immediate cube detection (used in SEARCHING state)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# WAYPOINT LOADER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_waypoints(path):
-    """
-    Reads a CSV file containing the search path waypoints.
-    Each row must have 'x_m' and 'y_m' columns (real-world metres).
-    Returns a list of (x, y) tuples in order.
-    """
-    waypoints = []
-    with open(path, newline='') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            waypoints.append((float(row['x_m']), float(row['y_m'])))
-    return waypoints
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN NODE CLASS
-# ─────────────────────────────────────────────────────────────────────────────
 
 class WaypointNav(Node):
+
     def __init__(self):
         super().__init__('waypoint_nav')
+        self._last_replan_time = 0.0
 
-        # ── Publishers ────────────────────────────────────────────────────────
-        # cmd_vel is the velocity command topic — publishing Twist messages here drives the robot
         self.pub = self.create_publisher(Twist, f'{NAMESPACE}/cmd_vel', 10)
-
-        # ── Subscribers ───────────────────────────────────────────────────────
-        # LiDAR scan — uses sensor QoS profile to tolerate dropped packets at high rates
         self.create_subscription(LaserScan, f'{NAMESPACE}/scan',
             self.scan_callback, qos_profile_sensor_data)
-
-        # Compressed camera image — also high rate, so sensor QoS is used
         self.create_subscription(CompressedImage,
             f'{NAMESPACE}/oakd/rgb/image_raw/compressed',
             self.image_callback, qos_profile_sensor_data)
-
-        # Odometry — robot's estimated position and orientation from wheel encoders
         self.create_subscription(Odometry, f'{NAMESPACE}/odom',
             self.odom_callback, 10)
 
-        # ── Shared state: LiDAR ───────────────────────────────────────────────
-        # These are updated every time a LiDAR scan arrives (scan_callback)
-        self.nearest_front = float('inf')  # Closest obstacle directly ahead
-        self.nearest_left  = float('inf')  # Closest obstacle to the left (used for turn decisions)
-        self.nearest_right = float('inf')  # Closest obstacle to the right
+        self.nearest_front = float('inf')
+        self.nearest_left  = float('inf')
+        self.nearest_right = float('inf')
 
-        # ── Shared state: Odometry ────────────────────────────────────────────
-        # Updated every time an odometry message arrives (odom_callback)
-        self.current_x   = 0.0   # Robot's X position in metres from the origin
-        self.current_y   = 0.0   # Robot's Y position in metres from the origin
-        self.current_yaw = 0.0   # Robot's heading in radians (0 = facing +X axis)
+        self.current_x   = 0.0
+        self.current_y   = 0.0
+        self.current_yaw = 0.0
+        self.odom_trail  = []
 
-        # ── Shared state: Camera ─────────────────────────────────────────────
-        self.cube_detected     = False  # Set to True once the cube is seen with enough pixels
-        self.latest_red_pixels = 0      # Number of red pixels in the most recent camera frame
+        self.cube_detected     = False
+        self.latest_red_pixels = 0
+        self.latest_img        = None
 
-        # ── Waypoint navigation state ─────────────────────────────────────────
-        self.waypoints = load_waypoints(WAYPOINTS_CSV)
-        self.get_logger().info(f'Loaded {len(self.waypoints)} waypoints')
-        self.wp_index     = 0          # Index of the current target waypoint
-        self.search_phase = 'TURNING'  # Within SEARCHING: either 'TURNING' (aligning) or 'DRIVING' (moving)
+        self.map_resolution   = None
+        self.map_origin       = None
+        self.map_h            = None
+        self.map_w            = None
+        self.live_grid        = None   # mutable occupancy grid updated from LiDAR
+        self.phase1_navigable = None   # read-only Phase 1 free/obstacle mask
+                                       # used by _save_live_map to colour new obstacles
+        self.phase1_dist      = None   # read-only Phase 1 distance transform
+        self.hit_counts       = None
+        self.map_goal         = None
 
-        # ── Obstacle avoidance state ──────────────────────────────────────────
-        self.avoid_turn_dir      = 1       # +1 = turn left, -1 = turn right (chosen based on which side is more open)
-        self.avoid_track_side    = 'right' # Which LiDAR arc to watch during AVOID_PASS ('left' or 'right')
-        self.avoid_geo_min_m     = 0.0     # Geometric minimum distance the robot must travel before checking side clear
-        self.avoid_pass_start_x  = 0.0     # Robot X when AVOID_PASS began (used to measure distance travelled)
-        self.avoid_pass_start_y  = 0.0     # Robot Y when AVOID_PASS began
+        self._wp_lock     = threading.Lock()
+        self.waypoints    = []
+        self.wp_index     = 0
+        self.search_phase = 'TURNING'
 
-        # ── Odometry trail (for map overlay at the end) ───────────────────────
-        self.odom_trail = []  # List of (x, y) tuples recorded throughout the run
+        self.replan_needed = False
+        self.replanning    = False
+        self._replan_lock  = threading.Lock()
 
-        # ── Cube-finding sub-state machine ────────────────────────────────────
-        # After reaching all waypoints, the robot transitions to CUBE_FINDING.
-        # This has four sequential phases:
-        #   ALIGN_NEG_Y  → rotate to face the -Y direction (toward the far end of the arena)
-        #   SWEEP        → slowly rotate 180° CW, recording red pixel counts at each angle
-        #   ALIGN_CUBE   → rotate back to the angle where red pixels were highest
-        #   APPROACH     → drive slowly forward until the cube fills enough of the frame
         self.cf_phase        = 'ALIGN_NEG_Y'
-        self.sweep_start_yaw = None    # Yaw at the moment the sweep began
-        self.sweep_readings  = []      # List of (yaw, red_pixels) samples collected during SWEEP
-        self.cube_target_yaw = None    # The yaw angle the robot will face after identifying the cube direction
-        self.sweep_last_yaw  = None    # Yaw from the previous tick, used to compute incremental rotation delta
-        self.swept_total     = 0.0     # Total radians rotated during the sweep (accumulated incrementally)
+        self.sweep_readings  = []
+        self.cube_target_yaw = None
+        self.sweep_last_yaw  = None
+        self.swept_total     = 0.0
 
-        # ── Top-level state machine ───────────────────────────────────────────
-        # SEARCHING  → following waypoints, watching for the cube
-        # AVOIDING   → an obstacle appeared; turning until clear
-        # AVOID_FWD  → driving forward briefly after clearing the obstacle
-        # CUBE_FINDING → all waypoints done; running the sweep-and-approach sequence
-        # DETECTED   → cube seen during SEARCHING; stop immediately
-        # DONE       → everything finished; hold position
         self.state = 'SEARCHING'
 
-        # Control loop fires every 0.1 seconds (10 Hz)
-        self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info('Waypoint nav started')
+        self._load_and_plan()
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # SUBSCRIBER CALLBACKS
-    # ─────────────────────────────────────────────────────────────────────────
+        self.timer = self.create_timer(0.1, self.control_loop)
+        self.get_logger().info('=== Autonomous search node started ===')
+
+    # ── MAP LOADING ───────────────────────────────────────────────────────────
+
+    def _load_and_plan(self):
+        pgm_path  = os.path.join(MAP_DIR, 'map.pgm')
+        yaml_path = os.path.join(MAP_DIR, 'map.yaml')
+        self.get_logger().info(f'Loading Phase 1 map from {MAP_DIR} ...')
+
+        free_grid, resolution, origin, _ = load_map(pgm_path, yaml_path)
+        h, w = free_grid.shape
+        self.map_resolution = resolution
+        self.map_origin     = origin
+        self.map_h          = h
+        self.map_w          = w
+
+        navigable = largest_free_region(free_grid)
+        dist_map  = cv2.distanceTransform(navigable, cv2.DIST_L2, 5)
+
+        # Store Phase 1 navigable grid read-only — used by _save_live_map
+        # to identify cells that were free in Phase 1 but are now blocked
+        self.phase1_navigable = navigable.copy().astype(np.uint8)
+        self.phase1_dist      = dist_map
+        self.live_grid        = navigable.copy().astype(np.uint8)
+        self.hit_counts       = np.zeros((h, w), dtype=np.uint8)
+
+        start_px = world_to_pixel(0.0, 0.0, origin, resolution, h)
+        if navigable[start_px[0], start_px[1]] == 0:
+            free_coords = np.argwhere(navigable == 1)
+            dists = np.sum((free_coords - np.array(start_px))**2, axis=1)
+            start_px = tuple(free_coords[np.argmin(dists)])
+
+        self.map_goal = find_dead_end(navigable, dist_map, start_px)
+        gx, gy = pixel_to_world(*self.map_goal, origin, resolution, h)
+        self.get_logger().info(
+            f'Dead-end goal: pixel {self.map_goal} → world ({gx:.2f}, {gy:.2f}) m')
+
+        path = astar(navigable, dist_map, start_px, self.map_goal)
+        if path is None:
+            self.get_logger().error('Initial A* found no path.')
+            return
+
+        start_world = pixel_to_world(*start_px, origin, resolution, h)
+        wp_pixels   = thin(path, WAYPOINT_STEP, start_world, origin, resolution, h)
+        world_wps   = [pixel_to_world(r, c, origin, resolution, h) for r, c in wp_pixels]
+
+        with self._wp_lock:
+            self.waypoints = world_wps
+            self.wp_index  = 0
+
+        self.get_logger().info(
+            f'Initial plan: {len(world_wps)} waypoints | '
+            f'first=({world_wps[0][0]:.2f}, {world_wps[0][1]:.2f}) | '
+            f'last=({world_wps[-1][0]:.2f}, {world_wps[-1][1]:.2f})')
+
+    # ── SUBSCRIBER CALLBACKS ──────────────────────────────────────────────────
 
     def scan_callback(self, msg):
-        """
-        Called every time a LiDAR scan arrives.
-        Computes the minimum distance in three arcs:
-          - front arc (obstacle ahead)
-          - left arc (used to decide which way to turn)
-          - right arc
-        The FRONT_OFFSET_DEG constant adjusts for the fact that index 0 in the
-        scan array may not point directly forward on this robot's LiDAR mount.
-        """
-        inc      = msg.angle_increment                          # Radians between consecutive scan rays
-        n        = len(msg.ranges)                              # Total number of rays in the scan
-        offset_i = int(round(math.radians(FRONT_OFFSET_DEG) / inc))  # Shift index to correct LiDAR mounting offset
-        front_i  = int(round(-msg.angle_min / inc)) + offset_i       # Index of the ray pointing directly forward
-        half_a   = int(round(math.radians(FRONT_ARC_DEG / 2) / inc)) # Half-width of the front arc in indices
-        side_a   = int(round(math.radians(90) / inc))                 # 90° in indices, used for left/right arcs
+        inc      = msg.angle_increment
+        n        = len(msg.ranges)
+        offset_i = int(round(math.radians(FRONT_OFFSET_DEG) / inc))
+        front_i  = int(round(-msg.angle_min / inc)) + offset_i
+        half_a   = int(round(math.radians(FRONT_ARC_DEG / 2) / inc))
+        side_a   = int(round(math.radians(90) / inc))
 
         def arc_min(lo, hi):
-            """Return the minimum valid range reading between index lo and hi (wraps around using modulo)."""
             indices = [i % n for i in range(lo, hi + 1)]
             vals = [msg.ranges[i] for i in indices
-                    if math.isfinite(msg.ranges[i])          # Exclude inf/NaN values
-                    and msg.range_min < msg.ranges[i] < msg.range_max]  # Exclude out-of-range readings
-            return min(vals) if vals else float('inf')       # Return inf if no valid readings
+                    if math.isfinite(msg.ranges[i])
+                    and msg.range_min < msg.ranges[i] < msg.range_max]
+            return min(vals) if vals else float('inf')
 
-        self.nearest_front = arc_min(front_i - half_a, front_i + half_a)  # Centre arc
-        self.nearest_left  = arc_min(front_i,          front_i + side_a)  # Left 90° arc
-        self.nearest_right = arc_min(front_i - side_a, front_i)           # Right 90° arc
+        self.nearest_front = arc_min(front_i - half_a, front_i + half_a)
+        self.nearest_left  = arc_min(front_i,          front_i + side_a)
+        self.nearest_right = arc_min(front_i - side_a, front_i)
+
+        if self.live_grid is None or self.state not in ('SEARCHING', 'WAITING_REPLAN'):
+            return
+
+        new_obstacles_found = []
+        for i in range(0, n, SCAN_SAMPLE_RATE):
+            r = msg.ranges[i]
+            if not math.isfinite(r) or r < msg.range_min or r > SCAN_MAX_RANGE_M:
+                continue
+            robot_angle = (i - front_i) * inc
+            world_angle = robot_angle + self.current_yaw
+            wx = self.current_x + r * math.cos(world_angle)
+            wy = self.current_y + r * math.sin(world_angle)
+            col = int(round((wx - self.map_origin[0]) / self.map_resolution))
+            row = self.map_h - int(round((wy - self.map_origin[1]) / self.map_resolution))
+            if not (0 <= row < self.map_h and 0 <= col < self.map_w):
+                continue
+            if self.live_grid[row, col] != 1:
+                continue
+            if self.phase1_dist[row, col] < MIN_NEW_OBS_DIST_PX:
+                continue
+            self.hit_counts[row, col] += 1
+            if self.hit_counts[row, col] >= HIT_THRESHOLD:
+                self.live_grid[row, col] = 0
+                new_obstacles_found.append((row, col))
+
+        if not new_obstacles_found:
+            return
+
+        should_replan = False
+        for row, col in new_obstacles_found:
+            ox, oy = pixel_to_world(row, col,
+                                    self.map_origin, self.map_resolution, self.map_h)
+            dist = math.sqrt((ox - self.current_x)**2 + (oy - self.current_y)**2)
+            if dist < REPLAN_NEARBY_M:
+                should_replan = True
+                break
+        if not should_replan:
+            should_replan = self._path_blocked()
+        if should_replan and not self.replanning:
+            self.replan_needed = True
 
     def odom_callback(self, msg):
-        """
-        Called every time an odometry message arrives.
-        Extracts the robot's (x, y) position and yaw (heading) from the message.
-        Yaw is derived from the quaternion orientation using the standard formula.
-        Also appends the current position to odom_trail for the final map overlay.
-        """
         self.current_x = msg.pose.pose.position.x
         self.current_y = msg.pose.pose.position.y
-
-        # Convert quaternion to yaw (rotation around the vertical Z axis)
         q = msg.pose.pose.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.current_yaw = math.atan2(siny, cosy)  # Result in radians: -π to +π
-
+        self.current_yaw = math.atan2(siny, cosy)
         self.odom_trail.append((self.current_x, self.current_y))
 
     def image_callback(self, msg):
-        """
-        Called every time a compressed camera frame arrives.
-        Decodes the JPEG image, converts to HSV, and counts red pixels using two masks
-        (because red wraps around the hue axis in HSV).
-        If the pixel count exceeds MIN_PIXELS while SEARCHING, flags cube_detected = True,
-        which the control loop will act on at the next 10 Hz tick.
-        Does NOT process images once the cube has been found or the run is over.
-        """
-        # Decode compressed JPEG bytes into an OpenCV BGR image
         buf = np.frombuffer(msg.data, dtype=np.uint8)
         img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
         if img is None:
-            return  # Skip if decoding failed (e.g., corrupted frame)
-
-        # Convert BGR → HSV for colour thresholding
+            return
+        self.latest_img = img
         hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-        # Create a binary mask where red pixels are white (255), everything else is black (0)
         mask = cv2.bitwise_or(
-            cv2.inRange(hsv, RED_LOW1, RED_HIGH1),  # Low-end red (hue 0–10)
-            cv2.inRange(hsv, RED_LOW2, RED_HIGH2))  # High-end red (hue 170–180)
-
-        self.latest_red_pixels = cv2.countNonZero(mask)  # Count white pixels in the mask
-
-        # Only trigger a detection flag during SEARCHING (not during cube approach or after done)
+            cv2.inRange(hsv, RED_LOW1, RED_HIGH1),
+            cv2.inRange(hsv, RED_LOW2, RED_HIGH2))
+        self.latest_red_pixels = cv2.countNonZero(mask)
         if self.state not in ('DETECTED', 'DONE', 'CUBE_FINDING'):
             if self.latest_red_pixels >= MIN_PIXELS:
-                self.cube_detected = True  # Control loop will handle this next tick
+                self.cube_detected = True
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # HELPER METHODS
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── HELPERS ───────────────────────────────────────────────────────────────
 
     def stop(self):
-        """Publish a zero-velocity Twist to halt the robot immediately."""
-        self.pub.publish(Twist())  # Default Twist has all fields = 0
+        self.pub.publish(Twist())
 
     def _publish_twist(self, lin, ang):
-        """Convenience wrapper: publish a Twist with given linear and angular velocities."""
         cmd = Twist()
-        cmd.linear.x  = lin  # Forward/backward speed (m/s)
-        cmd.angular.z = ang  # Rotation speed (rad/s); positive = counterclockwise
+        cmd.linear.x  = lin
+        cmd.angular.z = ang
         self.pub.publish(cmd)
 
     def _distance_to_wp(self):
-        """Return the straight-line distance (metres) from the robot's current position to the active waypoint."""
-        wx, wy = self.waypoints[self.wp_index]
+        with self._wp_lock:
+            if self.wp_index >= len(self.waypoints):
+                return float('inf')
+            wx, wy = self.waypoints[self.wp_index]
         return math.sqrt((self.current_x - wx)**2 + (self.current_y - wy)**2)
 
     def _heading_error(self):
-        """
-        Return the signed angular error (radians) between the robot's current yaw
-        and the direction it needs to face to head toward the active waypoint.
-        Positive = need to turn left (counterclockwise), negative = turn right.
-        Wraps to [-π, +π] so the robot always takes the shortest turn.
-        """
-        wx, wy = self.waypoints[self.wp_index]
+        with self._wp_lock:
+            if self.wp_index >= len(self.waypoints):
+                return 0.0
+            wx, wy = self.waypoints[self.wp_index]
         dx = wx - self.current_x
         dy = wy - self.current_y
-        target = math.atan2(dy, dx)          # Desired heading angle
-        err    = target - self.current_yaw   # Raw error
-        return math.atan2(math.sin(err), math.cos(err))  # Wrap to [-π, +π]
+        target = math.atan2(dy, dx)
+        err    = target - self.current_yaw
+        return math.atan2(math.sin(err), math.cos(err))
 
-    def _advance_waypoint(self):
+    def _path_blocked(self):
+        with self._wp_lock:
+            lookahead = self.waypoints[self.wp_index : self.wp_index + REPLAN_LOOKAHEAD]
+        for wx, wy in lookahead:
+            col = int(round((wx - self.map_origin[0]) / self.map_resolution))
+            row = self.map_h - int(round((wy - self.map_origin[1]) / self.map_resolution))
+            if 0 <= row < self.map_h and 0 <= col < self.map_w:
+                if self.live_grid[row, col] == 0:
+                    return True
+        return False
+
+    def _trigger_replan(self):
+        self.replan_needed = False  # Always clear — scan_callback will re-set if needed
+        if time.time() - self._last_replan_time < REPLAN_COOLDOWN_S:
+            return False            # Cooldown active — skip but don't block driving
+        with self._replan_lock:
+            if self.replanning:
+                return False
+            self.replanning = True
+        self.get_logger().info('New obstacle(s) detected — triggering background replan ...')
+        threading.Thread(target=self._replan_thread, daemon=True).start()
+        return True
+
+    def _save_live_map(self):
         """
-        Called after the robot has finished passing an obstacle.
-        Tries to resume the CURRENT waypoint first — the robot may now have a
-        clear path to it from the new position. Only skips to the next waypoint
-        if the current one is already within WAYPOINT_RADIUS (i.e. we drove past
-        it while avoiding). This is smarter than always skipping, because the
-        detour may have actually brought us close to the original target.
+        Save the current live map state to ~/Downloads/map/live_map.png.
+
+        Updated after every replan and at shutdown so you can open the file
+        in any image viewer to see the map evolving in real time.
+
+        Colour key:
+          Background  = Phase 1 SLAM map (greyscale)
+          Red pixels  = cells free in Phase 1 but now blocked (new Phase 2 obstacles)
+          Cyan dots   = remaining waypoints still to visit
+          Grey dots   = waypoints already passed
+          Green dot   = robot's current position
         """
-        if self._distance_to_wp() < WAYPOINT_RADIUS:
-            # We happened to pass through the waypoint's radius during avoidance
-            self.wp_index += 1
+        try:
+            pgm_path  = os.path.join(MAP_DIR, 'map.pgm')
+            yaml_path = os.path.join(MAP_DIR, 'map.yaml')
+            img = cv2.imread(pgm_path, cv2.IMREAD_GRAYSCALE)
+            if img is None or self.live_grid is None:
+                return
+
+            import yaml as _yaml
+            with open(yaml_path) as f:
+                meta = _yaml.safe_load(f)
+            resolution = meta['resolution']
+            origin     = meta['origin']
+
+            h, w  = img.shape
+            scale = 8
+            vis   = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+            vis   = cv2.resize(vis, (w * scale, h * scale),
+                               interpolation=cv2.INTER_NEAREST)
+
+            # Red = new obstacles (free in Phase 1, now blocked in live_grid)
+            if self.phase1_navigable is not None:
+                new_obs = (self.phase1_navigable == 1) & (self.live_grid == 0)
+                for r, c in zip(*np.where(new_obs)):
+                    vis[r*scale:(r+1)*scale, c*scale:(c+1)*scale] = (0, 0, 255)
+
+            # Waypoints: cyan = remaining, grey = already passed
+            with self._wp_lock:
+                wps = list(self.waypoints)
+                idx = self.wp_index
+            for i, (wx, wy) in enumerate(wps):
+                col = int(round((wx - origin[0]) / resolution))
+                row = h - int(round((wy - origin[1]) / resolution))
+                if 0 <= row < h and 0 <= col < w:
+                    colour = (0, 220, 220) if i >= idx else (100, 100, 100)
+                    cv2.circle(vis, (col*scale, row*scale), 4, colour, -1)
+
+            # Green dot = robot position
+            rx_col = int(round((self.current_x - origin[0]) / resolution))
+            rx_row = h - int(round((self.current_y - origin[1]) / resolution))
+            if 0 <= rx_row < h and 0 <= rx_col < w:
+                cv2.circle(vis, (rx_col*scale, rx_row*scale), 7, (60, 220, 60), -1)
+                cv2.putText(vis, 'robot', (rx_col*scale + 8, rx_row*scale - 6),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (60, 220, 60), 1)
+
+            cv2.imwrite(os.path.join(MAP_DIR, 'live_map.png'), vis)
+
+        except Exception as e:
+            self.get_logger().warn(f'live map save failed: {e}')
+
+    def _replan_thread(self):
+        try:
+            start_x = self.current_x
+            start_y = self.current_y
+            grid_snapshot = self.live_grid.copy()
+
+            kernel   = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (ROBOT_RADIUS_PX * 2 + 1, ROBOT_RADIUS_PX * 2 + 1))
+            inflated = cv2.erode(grid_snapshot, kernel)
+            dist     = cv2.distanceTransform(inflated, cv2.DIST_L2, 5)
+
+            start_px = world_to_pixel(start_x, start_y,
+                                      self.map_origin, self.map_resolution, self.map_h)
+            if not inflated[start_px[0], start_px[1]]:
+                free_coords = np.argwhere(inflated == 1)
+                if len(free_coords) == 0:
+                    self.get_logger().error(
+                        'Replan: no free space after inflation — keeping existing plan.')
+                    return
+                dists    = np.sum((free_coords - np.array(start_px))**2, axis=1)
+                start_px = tuple(free_coords[np.argmin(dists)])
+
             self.get_logger().info(
-                f'Waypoint {self.wp_index} passed during avoidance — advancing to {self.wp_index+1}')
-        else:
-            # Current waypoint still ahead — try to reach it from the new position
-            self.get_logger().info(
-                f'Resuming waypoint {self.wp_index+1} from new position '
-                f'({self.current_x:.2f}, {self.current_y:.2f})')
-        if self.wp_index >= len(self.waypoints):
-            self.state = 'CUBE_FINDING'
-            self.cf_phase = 'ALIGN_NEG_Y'
-        else:
+                f'Replan A*: from pixel {start_px} → goal {self.map_goal} ...')
+            path = astar(inflated, dist, start_px, self.map_goal)
+
+            if path is None:
+                self.get_logger().warn(
+                    'Replan: no path with full inflation — retrying with reduced inflation ...')
+                kernel_small   = cv2.getStructuringElement(
+                    cv2.MORPH_ELLIPSE, (ROBOT_RADIUS_PX + 1, ROBOT_RADIUS_PX + 1))
+                inflated_small = cv2.erode(grid_snapshot, kernel_small)
+                dist_small     = cv2.distanceTransform(inflated_small, cv2.DIST_L2, 5)
+                if not inflated_small[start_px[0], start_px[1]]:
+                    free_coords = np.argwhere(inflated_small == 1)
+                    if len(free_coords) > 0:
+                        dists    = np.sum((free_coords - np.array(start_px))**2, axis=1)
+                        start_px = tuple(free_coords[np.argmin(dists)])
+                path = astar(inflated_small, dist_small, start_px, self.map_goal)
+                dist = dist_small
+
+            if path is None:
+                self.get_logger().error(
+                    'Replan: no path found even with reduced inflation. '
+                    'Robot will hold position until manually restarted.')
+                return
+
+            start_world = (start_x, start_y)
+            wp_pixels   = thin(path, WAYPOINT_STEP, start_world,
+                               self.map_origin, self.map_resolution, self.map_h)
+            world_wps   = [pixel_to_world(r, c, self.map_origin,
+                                          self.map_resolution, self.map_h)
+                           for r, c in wp_pixels]
+
+            skip_radius = 0.4
+            start_idx   = 0
+            for idx, (wx, wy) in enumerate(world_wps):
+                d = math.sqrt((wx - start_x)**2 + (wy - start_y)**2)
+                if d < skip_radius:
+                    start_idx = idx + 1
+                else:
+                    break
+            start_idx = min(start_idx, len(world_wps) - 1)
+
+            with self._wp_lock:
+                self.waypoints = world_wps
+                self.wp_index  = start_idx
+
             self.search_phase = 'TURNING'
-            self.state = 'SEARCHING'
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # MAIN CONTROL LOOP  (runs at 10 Hz via self.timer)
-    # ─────────────────────────────────────────────────────────────────────────
+            self.get_logger().info(
+                f'Replan complete: {len(world_wps)} waypoints | '
+                f'start ({start_x:.2f}, {start_y:.2f}) → '
+                f'goal ({world_wps[-1][0]:.2f}, {world_wps[-1][1]:.2f}) | '
+                f'resuming from wp {start_idx+1}/{len(world_wps)}')
+
+            # Save live map image after every successful replan
+            self._save_live_map()
+
+        except Exception as e:
+            self.get_logger().error(f'Replan thread error: {e}')
+
+        finally:
+            with self._replan_lock:
+                self.replanning = False
+            self._last_replan_time = time.time()
+
+    # ── CONTROL LOOP (10 Hz) ──────────────────────────────────────────────────
 
     def control_loop(self):
         if self.state == 'DONE':
-            return  # Nothing to do once the run is finished
+            return
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STATE: SEARCHING
-        # The robot follows the loaded waypoints in order. At each waypoint it
-        # first turns to face it (TURNING sub-phase) then drives straight to it
-        # (DRIVING sub-phase). While doing this it also watches for the cube and
-        # for obstacles. If an obstacle appears it switches to AVOIDING.
-        # ─────────────────────────────────────────────────────────────────────
+        # Emergency stop
+        if (self.state in ('SEARCHING', 'WAITING_REPLAN')
+                and self.nearest_front < EMERGENCY_DIST):
+            self.stop()
+            if not self.replanning:
+                if self._trigger_replan():
+                    self.state = 'WAITING_REPLAN'
+            return
+
+        if self.state == 'WAITING_REPLAN':
+            if not self.replanning:
+                self.get_logger().info('Replan done — resuming SEARCHING')
+                self.search_phase = 'TURNING'
+                self.state = 'SEARCHING'
+            else:
+                self.stop()
+            return
+
         if self.state == 'SEARCHING':
 
-            # ── Cube spotted? ────────────────────────────────────────────────
             if self.cube_detected:
                 self.state = 'DETECTED'
                 self.stop()
-                self.get_logger().info('RED CUBE DETECTED')
                 self.get_logger().info(
-                    f'Position: x={self.current_x:.3f} y={self.current_y:.3f}')
+                    f'RED CUBE DETECTED at odometry '
+                    f'x={self.current_x:.3f} m  y={self.current_y:.3f} m')
+                if self.latest_img is not None:
+                    snap_path = os.path.join(MAP_DIR, 'detection_snapshot.jpg')
+                    cv2.imwrite(snap_path, self.latest_img)
+                    self.get_logger().info(f'Detection snapshot saved to {snap_path}')
                 return
 
-            # ── Obstacle too close? ──────────────────────────────────────────
-            if self.nearest_front < AVOID_DISTANCE:
-                # Decide which way to turn: toward the more open side
-                self.avoid_turn_dir = 1 if self.nearest_left >= self.nearest_right else -1
-
-                # Record which side the obstacle is on so AVOID_PASS knows which
-                # arc to watch. If we turned left, the obstacle was on the right.
-                self.avoid_track_side = 'right' if self.avoid_turn_dir == 1 else 'left'
-
-                # Geometric minimum: the robot should travel at least this far
-                # before we trust the side-clear signal. nearest_front is how far
-                # away the obstacle is right now — adding a buffer accounts for
-                # the robot's own width and approach angle.
-                raw_dist = self.nearest_front if math.isfinite(self.nearest_front) else AVOID_DISTANCE
-                self.avoid_geo_min_m = raw_dist + AVOID_GEO_BUFFER_M
-
-                self.get_logger().info(
-                    f'Obstacle at {self.nearest_front:.2f}m — '
-                    f'turning {"LEFT" if self.avoid_turn_dir > 0 else "RIGHT"} | '
-                    f'geo_min={self.avoid_geo_min_m:.2f}m tracking {self.avoid_track_side} arc')
-                self.state = 'AVOIDING'
+            if self.replan_needed and not self.replanning:
+                self.stop()
+                if self._trigger_replan():
+                    self.state = 'WAITING_REPLAN'
                 return
 
-            # ── TURNING sub-phase: rotate to face the next waypoint ──────────
+            with self._wp_lock:
+                all_done = self.wp_index >= len(self.waypoints)
+                n_wps    = len(self.waypoints)
+
+            if all_done:
+                self.get_logger().info('All waypoints reached — entering CUBE_FINDING')
+                self._init_cube_finding()
+                self.state = 'CUBE_FINDING'
+                return
+
             if self.search_phase == 'TURNING':
                 err = self._heading_error()
                 self.get_logger().info(
-                    f'[TURNING] wp={self.wp_index+1}/{len(self.waypoints)} '
-                    f'err={math.degrees(err):.1f}°')
+                    f'[TURNING] wp {self.wp_index+1}/{n_wps}  err={math.degrees(err):.1f}°')
                 if abs(err) < HEADING_TOL:
-                    # Heading is close enough — switch to driving
                     self.stop()
                     self.search_phase = 'DRIVING'
                     self.get_logger().info(f'Aligned — driving to waypoint {self.wp_index+1}')
                 else:
-                    # Keep rotating toward the target heading
                     self._publish_twist(0.0, TURN_SPEED if err > 0 else -TURN_SPEED)
 
-            # ── DRIVING sub-phase: drive straight to the waypoint ────────────
             elif self.search_phase == 'DRIVING':
                 dist = self._distance_to_wp()
                 self.get_logger().info(
-                    f'[DRIVING] wp={self.wp_index+1}/{len(self.waypoints)} dist={dist:.3f}m')
+                    f'[DRIVING] wp {self.wp_index+1}/{n_wps}  dist={dist:.3f} m')
                 if dist < WAYPOINT_RADIUS:
-                    # Waypoint reached — advance to the next one
                     self.stop()
-                    self.wp_index += 1
-                    if self.wp_index >= len(self.waypoints):
-                        # All waypoints done — enter cube-finding sweep mode
+                    with self._wp_lock:
+                        self.wp_index += 1
+                        all_done = self.wp_index >= len(self.waypoints)
+                    if all_done:
+                        self.get_logger().info('All waypoints reached — entering CUBE_FINDING')
+                        self._init_cube_finding()
                         self.state = 'CUBE_FINDING'
-                        self.cf_phase = 'ALIGN_NEG_Y'
-                        self.get_logger().info('All waypoints reached — CUBE_FINDING')
                     else:
-                        # More waypoints remain — turn to face the next one
                         self.search_phase = 'TURNING'
                         self.get_logger().info(
                             f'Waypoint reached — turning to waypoint {self.wp_index+1}')
                 else:
-                    # Not there yet — drive forward
                     self._publish_twist(FORWARD_SPEED, 0.0)
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STATE: AVOIDING
-        # Spin in place until the front arc is clear, then transition to
-        # AVOID_PASS where the robot drives forward using LiDAR to confirm
-        # it has genuinely cleared the obstacle's edge.
-        # ─────────────────────────────────────────────────────────────────────
-        elif self.state == 'AVOIDING':
-            if self.nearest_front >= AVOID_DISTANCE:
-                # Front is clear — record the current position so AVOID_PASS can
-                # measure how far the robot travels from this exact point.
-                self.avoid_pass_start_x = self.current_x
-                self.avoid_pass_start_y = self.current_y
-                self.state = 'AVOID_PASS'
-                self.get_logger().info(
-                    f'Front clear — entering AVOID_PASS | '
-                    f'geo_min={self.avoid_geo_min_m:.2f}m max={AVOID_MAX_FWD_M:.2f}m')
-            else:
-                # Still blocked — keep turning
-                self._publish_twist(0.0, TURN_SPEED * self.avoid_turn_dir)
-
-        # ─────────────────────────────────────────────────────────────────────
-        # STATE: AVOID_PASS
-        # Drive forward past the obstacle using three exit conditions:
-        #
-        #   1. Front blocked again → back to AVOIDING (new obstacle or corner)
-        #   2. Geometric minimum met AND side arc reads clear → obstacle edge passed
-        #   3. Hard distance cap exceeded → give up and re-plan (wall / long obstacle)
-        #
-        # This replaces the old timed AVOID_FWD and adapts dynamically to the
-        # size and distance of whatever the robot is passing.
-        # ─────────────────────────────────────────────────────────────────────
-        elif self.state == 'AVOID_PASS':
-            # Measure how far we've driven since entering this state
-            dx = self.current_x - self.avoid_pass_start_x
-            dy = self.current_y - self.avoid_pass_start_y
-            dist_travelled = math.sqrt(dx**2 + dy**2)
-
-            # Read the tracking arc on the side the obstacle was on
-            side_dist = (self.nearest_left if self.avoid_track_side == 'left'
-                         else self.nearest_right)
-
-            self.get_logger().info(
-                f'[AVOID_PASS] travelled={dist_travelled:.2f}m '
-                f'geo_min={self.avoid_geo_min_m:.2f}m '
-                f'{self.avoid_track_side}_arc={side_dist:.2f}m')
-
-            # Condition 1: front blocked again — a new obstacle or we've hit a corner
-            if self.nearest_front < AVOID_DISTANCE:
-                self.get_logger().warn('Front blocked during AVOID_PASS — re-entering AVOIDING')
-                self.state = 'AVOIDING'
-
-            # Condition 3: hard cap — the obstacle is a wall or much larger than expected
-            elif dist_travelled >= AVOID_MAX_FWD_M:
-                self.get_logger().warn(
-                    f'AVOID_PASS hard cap reached ({AVOID_MAX_FWD_M:.1f}m) — skipping waypoint')
-                self.stop()
-                self._advance_waypoint()
-
-            # Condition 2: geometric minimum met AND side arc has opened up
-            elif dist_travelled >= self.avoid_geo_min_m and side_dist >= AVOID_SIDE_CLEAR_M:
-                self.get_logger().info(
-                    f'Obstacle edge cleared (side_arc={side_dist:.2f}m > {AVOID_SIDE_CLEAR_M:.2f}m '
-                    f'after {dist_travelled:.2f}m) — resuming search')
-                self.stop()
-                self._advance_waypoint()
-
-            else:
-                # Still passing — keep driving forward
-                self._publish_twist(FORWARD_SPEED, 0.0)
-
-        # ─────────────────────────────────────────────────────────────────────
-        # STATE: CUBE_FINDING
-        # Runs after all waypoints are visited. Uses four sequential sub-phases
-        # to precisely locate and approach the red cube:
-        #   1. ALIGN_NEG_Y → face -Y (toward far end of arena)
-        #   2. SWEEP       → rotate 180° CW, recording red pixel counts per angle
-        #   3. ALIGN_CUBE  → turn to face the angle with the most red
-        #   4. APPROACH    → drive forward until close enough to the cube
-        # ─────────────────────────────────────────────────────────────────────
         elif self.state == 'CUBE_FINDING':
 
-            # ── Sub-phase 1: rotate to face -Y (yaw = -π/2) ──────────────────
             if self.cf_phase == 'ALIGN_NEG_Y':
-                target_yaw = -math.pi / 2.0   # -90° = facing the negative Y axis
-                err = target_yaw - self.current_yaw
-                err = math.atan2(math.sin(err), math.cos(err))  # Wrap to [-π, +π]
+                target_yaw = -math.pi / 2.0
+                err = math.atan2(
+                    math.sin(target_yaw - self.current_yaw),
+                    math.cos(target_yaw - self.current_yaw))
                 if abs(err) < HEADING_TOL:
-                    # Now facing -Y — initialise the sweep
                     self.stop()
-                    self.sweep_start_yaw = self.current_yaw
-                    self.sweep_last_yaw  = self.current_yaw
-                    self.swept_total     = 0.0
-                    self.sweep_readings  = []
+                    self.sweep_last_yaw = self.current_yaw
+                    self.swept_total    = 0.0
+                    self.sweep_readings = []
                     self.cf_phase = 'SWEEP'
                     self.get_logger().info('Aligned to -Y — starting 180° sweep')
                 else:
                     self._publish_twist(0.0, CUBE_TURN_SPEED if err > 0 else -CUBE_TURN_SPEED)
 
-            # ── Sub-phase 2: 180° clockwise sweep, sampling red pixels ────────
             elif self.cf_phase == 'SWEEP':
-                # Compute how much the robot has rotated since the last tick.
-                # We can't just subtract yaw values because they wrap at ±π,
-                # so we correct for wrap-around manually.
                 delta = self.sweep_last_yaw - self.current_yaw
-                if delta > math.pi:    # Wrapped the wrong way — correct by subtracting a full circle
-                    delta -= 2 * math.pi
-                elif delta < -math.pi: # Opposite wrap — add a full circle
-                    delta += 2 * math.pi
-                self.swept_total    += abs(delta)   # Accumulate total rotation (always positive)
-                self.sweep_last_yaw  = self.current_yaw
-                # Record the current yaw and red pixel count as one sample
+                if delta >  math.pi:  delta -= 2 * math.pi
+                if delta < -math.pi:  delta += 2 * math.pi
+                self.swept_total   += abs(delta)
+                self.sweep_last_yaw = self.current_yaw
                 self.sweep_readings.append((self.current_yaw, self.latest_red_pixels))
                 self.get_logger().info(
-                    f'[SWEEP] swept={math.degrees(self.swept_total):.1f}° '
+                    f'[SWEEP] swept={math.degrees(self.swept_total):.1f}°  '
                     f'red_px={self.latest_red_pixels}')
-
                 if self.swept_total >= math.radians(SWEEP_DEG):
-                    # 180° complete — find the direction with the most red pixels
                     self.stop()
-                    # Filter to only samples where red pixels exceeded the threshold
                     above = [(yaw, px) for yaw, px in self.sweep_readings
                              if px >= CUBE_PIXEL_THRESHOLD]
                     if above:
-                        # Pick the middle sample from the detected band to aim at the cube's centre
-                        mid_idx = len(above) // 2
-                        self.cube_target_yaw = above[mid_idx][0]
+                        self.cube_target_yaw = above[len(above) // 2][0]
                         self.get_logger().info(
                             f'Sweep done — cube at yaw={math.degrees(self.cube_target_yaw):.1f}°')
                         self.cf_phase = 'ALIGN_CUBE'
                     else:
-                        # Cube never exceeded threshold during the sweep — give up
-                        self.get_logger().warn('No cube detected in sweep — DONE')
+                        self.get_logger().warn('No cube detected during sweep — stopping')
                         self.state = 'DONE'
                 else:
-                    # Still sweeping — rotate clockwise (negative angular velocity)
                     self._publish_twist(0.0, -CUBE_TURN_SPEED)
 
-            # ── Sub-phase 3: rotate to face the identified cube angle ──────────
             elif self.cf_phase == 'ALIGN_CUBE':
-                err = self.cube_target_yaw - self.current_yaw
-                err = math.atan2(math.sin(err), math.cos(err))  # Wrap to [-π, +π]
+                err = math.atan2(
+                    math.sin(self.cube_target_yaw - self.current_yaw),
+                    math.cos(self.cube_target_yaw - self.current_yaw))
                 if abs(err) < HEADING_TOL:
-                    # Now facing the cube — start approach
                     self.stop()
                     self.cf_phase = 'APPROACH'
-                    self.get_logger().info('Facing cube — approaching')
+                    self.get_logger().info('Facing cube — beginning approach')
                 else:
                     self._publish_twist(0.0, CUBE_TURN_SPEED if err > 0 else -CUBE_TURN_SPEED)
 
-            # ── Sub-phase 4: slowly drive forward until cube fills the frame ──
             elif self.cf_phase == 'APPROACH':
-                self.get_logger().info(f'[APPROACH] red_px={self.latest_red_pixels}')
+                self.get_logger().info(
+                    f'[APPROACH] red_px={self.latest_red_pixels} (stop at {CUBE_STOP_PIXELS})')
                 if self.latest_red_pixels >= CUBE_STOP_PIXELS:
-                    # Enough pixels = cube is close — stop and declare DONE
                     self.stop()
-                    self.get_logger().info('Reached cube — DONE')
+                    self.get_logger().info(
+                        f'Cube reached — estimated position: '
+                        f'x={self.current_x:.3f} m  y={self.current_y:.3f} m')
+                    if self.latest_img is not None:
+                        snap_path = os.path.join(MAP_DIR, 'cube_approach_snapshot.jpg')
+                        cv2.imwrite(snap_path, self.latest_img)
+                        self.get_logger().info(f'Approach snapshot saved to {snap_path}')
                     self.state = 'DONE'
                 else:
-                    # Not there yet — keep creeping forward
                     self._publish_twist(CUBE_FWD_SPEED, 0.0)
 
-        # ─────────────────────────────────────────────────────────────────────
-        # STATE: DETECTED
-        # Cube was seen with enough pixels during SEARCHING (immediate detection).
-        # Stop and transition to DONE.
-        # ─────────────────────────────────────────────────────────────────────
         elif self.state == 'DETECTED':
             self.stop()
             self.state = 'DONE'
 
-        # ── Ensure robot is stopped when DONE ────────────────────────────────
         if self.state == 'DONE':
             self.stop()
-            self.get_logger().info('=== DONE ===')
+            self.get_logger().info(
+                f'=== RUN COMPLETE ===  '
+                f'Final position: x={self.current_x:.3f}  y={self.current_y:.3f}')
+
+    def _init_cube_finding(self):
+        self.cf_phase        = 'ALIGN_NEG_Y'
+        self.sweep_readings  = []
+        self.cube_target_yaw = None
+        self.sweep_last_yaw  = self.current_yaw
+        self.swept_total     = 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ODOMETRY MAP OVERLAY
-# ─────────────────────────────────────────────────────────────────────────────
+# ── POST-RUN OVERLAY ──────────────────────────────────────────────────────────
 
 def save_odom_map(trail, map_dir):
-    """
-    After the run, draws the robot's odometry trail on top of the SLAM map image
-    and saves the result as odom_overlay.png.
-
-    Requires map.pgm (the occupancy grid image) and map.yaml (the metadata file)
-    to be present in map_dir. These are produced by Task 6's map-saving step.
-
-    The trail is drawn as an orange line. Start = blue dot, End = green dot.
-    """
     pgm_path  = os.path.join(map_dir, 'map.pgm')
     yaml_path = os.path.join(map_dir, 'map.yaml')
-    out_path  = os.path.join(map_dir, 'odom_overlay.png')
-
     if not os.path.exists(pgm_path) or not os.path.exists(yaml_path):
         print(f'Map files not found in {map_dir} — skipping odom overlay')
         return
 
-    # Read the map metadata to convert real-world (x, y) to pixel coordinates
-    import yaml
+    import yaml as _yaml
     with open(yaml_path) as f:
-        meta = yaml.safe_load(f)
+        meta = _yaml.safe_load(f)
+    resolution = meta['resolution']
+    origin     = meta['origin']
 
-    resolution = meta['resolution']  # Metres per pixel (e.g. 0.05)
-    origin     = meta['origin']      # Real-world (x, y) of the bottom-left pixel corner
-
-    # Load the map as a grayscale image, then convert to BGR so we can draw coloured lines
     img = cv2.imread(pgm_path, cv2.IMREAD_GRAYSCALE)
     h, w = img.shape
-    scale = 8  # Upscale factor — makes small maps easier to see
+    scale = 8
     vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     vis = cv2.resize(vis, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
 
     def world_to_px(wx, wy):
-        """
-        Convert a real-world (x, y) position in metres to pixel coordinates
-        in the upscaled map image.
-        Map images have Y increasing downward but ROS uses Y increasing upward,
-        so we flip the row: row = h - row_from_bottom.
-        """
         col = int(round((wx - origin[0]) / resolution))
         row = h - int(round((wy - origin[1]) / resolution))
-        return col * scale, row * scale  # Scale up to match the resized image
+        return col * scale, row * scale
 
-    # Draw the trail as connected line segments
     if len(trail) > 1:
         pts = [world_to_px(x, y) for x, y in trail]
         for i in range(len(pts) - 1):
-            cv2.line(vis, pts[i], pts[i+1], (0, 200, 255), 2)  # Orange line
+            cv2.line(vis, pts[i], pts[i+1], (0, 200, 255), 2)
 
-    # Draw start (blue) and end (green) markers
     if trail:
         sx, sy = world_to_px(*trail[0])
         ex, ey = world_to_px(*trail[-1])
-        cv2.circle(vis, (sx, sy), 7, (60, 60, 255), -1)  # Blue dot = start
-        cv2.putText(vis, 'start', (sx+6, sy-6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 255), 1)
-        cv2.circle(vis, (ex, ey), 7, (60, 220, 60), -1)  # Green dot = end
-        cv2.putText(vis, 'end', (ex+6, ey-6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 220, 60), 1)
+        cv2.circle(vis, (sx, sy), 7, (60,  60, 255), -1)
+        cv2.putText(vis, 'start', (sx+6, sy-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 255), 1)
+        cv2.circle(vis, (ex, ey), 7, (60, 220,  60), -1)
+        cv2.putText(vis, 'end',   (ex+6, ey-6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 220, 60), 1)
 
+    out_path = os.path.join(map_dir, 'odom_overlay.png')
     cv2.imwrite(out_path, vis)
-    print(f'Odom overlay saved to {out_path}  ({len(trail)} points)')
+    print(f'Odom overlay saved → {out_path}  ({len(trail)} points)')
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ENTRY POINT
-# ─────────────────────────────────────────────────────────────────────────────
+# ── ENTRY POINT ───────────────────────────────────────────────────────────────
 
 def main(args=None):
-    rclpy.init(args=args)       # Initialise the ROS 2 Python client library
-    node = WaypointNav()        # Create and start the node
+    rclpy.init(args=args)
+    node = WaypointNav()
     try:
-        rclpy.spin(node)        # Hand control to the ROS 2 executor; runs until Ctrl+C
+        rclpy.spin(node)
     finally:
-        # Always runs on shutdown (even on crash or Ctrl+C):
-        save_odom_map(node.odom_trail, os.path.expanduser('~/Downloads/map'))
-        cv2.destroyAllWindows() # Close any OpenCV display windows
-        node.destroy_node()     # Clean up the ROS 2 node
-        rclpy.shutdown()        # Shut down the ROS 2 client library
+        save_odom_map(node.odom_trail, MAP_DIR)
+        node._save_live_map()   # Save final live map state on exit
+        cv2.destroyAllWindows()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

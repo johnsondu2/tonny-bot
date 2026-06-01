@@ -20,11 +20,11 @@ echo "Using TurtleBot: $TB"
 
 set-turtlebot $TB_NUM
 
-sleep 1
+# sleep 1
 
-echo "Undocking..."
+# echo "Undocking..."
 
-ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
+# ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
 
 sleep 1
 
@@ -53,20 +53,15 @@ echo "================================================="
 read -p "Press ENTER to save map..."
 
 echo "Saving map..."
-
-ros2 action send_goal /$TB/dock irobot_create_msgs/action/Dock "{}"
-
-sleep 1
+mkdir -p ~/Downloads/map
 
 ros2 run nav2_map_server map_saver_cli \
 -f ~/Downloads/map/map \
 --ros-args -r map:=/$TB/map
 
-sleep 5
+sleep 3
 
-echo "Map saved!"
-
-echo "Saving SLAM pose graph..."
+echo "Map saved! Saving SLAM pose graph..."
 
 ros2 service call /$TB/slam_toolbox/serialize_map \
 slam_toolbox/srv/SerializePoseGraph \
@@ -74,9 +69,10 @@ slam_toolbox/srv/SerializePoseGraph \
 
 sleep 3
 
-cd ~/ros2_ws/src/tb4_sensor_reader/tb4_sensor_reader
-python3 path_planner_v2.py
+# echo "Docking..."
+# ros2 action send_goal --feedback /$TB/dock irobot_create_msgs/action/Dock "{}"
 
-sleep 1
+cd ~/ros2_ws/src/tb4_sensor_reader/tb4_sensor_reader
+~/ros2_venv/bin/python3 path_planner_v2.py
 
 echo "DONE: Map + pose graph + path planning csv saved to Downloads"
