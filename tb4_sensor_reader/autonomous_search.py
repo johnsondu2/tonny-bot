@@ -17,7 +17,7 @@ from tb4_sensor_reader.path_planner_v2 import (
     WAYPOINT_STEP, CENTRE_WEIGHT,
 )
 
-NAMESPACE        = '/T21'
+NAMESPACE        = '/T10'
 FORWARD_SPEED    = 0.15
 TURN_SPEED       = 0.5
 FRONT_ARC_DEG    = 60
@@ -25,7 +25,7 @@ FRONT_OFFSET_DEG = -90.0
 REPLAN_COOLDOWN_S = 3.0
 MAP_DIR          = os.path.expanduser('~/Downloads/map')
 WAYPOINT_RADIUS  = 0.1
-HOME_RADIUS      = 0.20      # within this distance of (0,0) counts as returned
+HOME_RADIUS      = 0.10
 HEADING_TOL      = 0.08
 EMERGENCY_DIST   = 0.25
 ROBOT_RADIUS_PX  = 3
@@ -37,10 +37,20 @@ MIN_NEW_OBS_DIST_PX = 3
 HIT_THRESHOLD       = 3
 MIN_PIXELS           = 500000
 CUBE_PIXEL_THRESHOLD = 2000
-CUBE_STOP_PIXELS     = 30000
-CUBE_TURN_SPEED      = 0.1    # slow for better angular resolution during sweep
+CUBE_STOP_PIXELS     = 25000
+CUBE_TURN_SPEED      = 0.05
 CUBE_FWD_SPEED       = 0.08
-SWEEP_DEG            = 120.0  # 120° CW sweep centred on -X direction
+SWEEP_DEG            = 120.0
+RAMP_ACCEL           = 0.025
+RAMP_DECEL           = 0.05
+WAYPOINT_TURN_THRESHOLD = math.radians(45)
+WAYPOINT_TRACKING_GAIN  = 4.0
+
+# Stuck detector: if the robot hasn't closed the distance to the current
+# waypoint by STALL_IMPROVE_M within STALL_TICKS control ticks (~2 s at 10 Hz),
+# it is assumed to be circling an obstacle and a fresh replan is forced.
+STALL_TICKS    = 20
+STALL_IMPROVE_M = 0.02
 RED_LOW1  = np.array([0,   120, 70])
 RED_HIGH1 = np.array([10,  255, 255])
 RED_LOW2  = np.array([170, 120, 70])
@@ -70,17 +80,17 @@ class WaypointNav(Node):
         self.current_x   = 0.0
         self.current_y   = 0.0
         self.current_yaw = 0.0
-        self.odom_trail      = []   # full trail
-        self.outbound_trail  = []   # SEARCHING phase only
-        self.return_trail    = []   # RETURNING phase only
+        self.odom_trail      = []
+        self.outbound_trail  = []
+        self.return_trail    = []
         self.is_returning    = False
 
         self.cube_detected     = False
         self.latest_red_pixels = 0
         self.latest_img        = None
 
-        self.cube_odom = None   # (x, y) recorded when cube snapshot saved
-        self.home_odom = None   # (x, y) recorded when home reached
+        self.cube_odom = None
+        self.home_odom = None
 
         self.map_resolution   = None
         self.map_origin       = None
@@ -92,10 +102,15 @@ class WaypointNav(Node):
         self.hit_counts       = None
         self.map_goal         = None
 
-        self._wp_lock     = threading.Lock()
-        self.waypoints    = []
-        self.wp_index     = 0
-        self.search_phase = 'TURNING'
+        self._wp_lock      = threading.Lock()
+        self.waypoints     = []
+        self.wp_index      = 0
+        self.search_phase  = 'TURNING'
+        self._cmd_speed    = 0.0
+        # Stuck detector state — reset whenever we advance to a new waypoint
+        # or receive a fresh replan. See STALL_TICKS / STALL_IMPROVE_M.
+        self._wp_min_dist  = float('inf')
+        self._stall_count  = 0
 
         self.replan_needed = False
         self.replanning    = False
@@ -104,13 +119,15 @@ class WaypointNav(Node):
         # Cube-finding sub-state:
         #   ALIGN_NEG_X → face -120° (60° CCW from -X)
         #   SWEEP       → 120° CW sweep through -X, recording red pixel counts
-        #   ALIGN_CUBE  → rotate to face the angle with the most red pixels
+        #                 as relative yaw offsets from sweep_start_yaw
+        #   ALIGN_CUBE  → rotate to face cube using relative yaw
         #   APPROACH    → creep forward until cube fills the frame
-        self.cf_phase        = 'ALIGN_NEG_X'
-        self.sweep_readings  = []
-        self.cube_target_yaw = None
-        self.sweep_last_yaw  = None
-        self.swept_total     = 0.0
+        self.cf_phase            = 'ALIGN_NEG_X'
+        self.sweep_readings      = []
+        self.cube_target_rel_yaw = None
+        self.sweep_start_yaw     = None
+        self.sweep_last_yaw      = None
+        self.swept_total         = 0.0
 
         self.state = 'SEARCHING'
 
@@ -263,7 +280,20 @@ class WaypointNav(Node):
     # ── HELPERS ───────────────────────────────────────────────────────────────
 
     def stop(self):
+        self._cmd_speed = 0.0
         self.pub.publish(Twist())
+
+    def _drive_ramped(self, target_speed, steer):
+        """
+        Publish a forward velocity command with smooth speed ramping.
+        Accelerates at RAMP_ACCEL and decelerates at RAMP_DECEL per 100ms tick,
+        avoiding the abrupt velocity steps that cause the robot to jerk.
+        """
+        if target_speed > self._cmd_speed:
+            self._cmd_speed = min(target_speed, self._cmd_speed + RAMP_ACCEL)
+        elif target_speed < self._cmd_speed:
+            self._cmd_speed = max(target_speed, self._cmd_speed - RAMP_DECEL)
+        self._publish_twist(self._cmd_speed, steer)
 
     def _publish_twist(self, lin, ang):
         cmd = Twist()
@@ -328,11 +358,6 @@ class WaypointNav(Node):
         """
         Plan a path from the robot's current position back to (0,0) using
         the live map so all detected Phase 2 obstacles are avoided.
-
-        Replaces self.waypoints with the return path and resets wp_index to 0.
-        Returns True on success, False if no path found (caller should fall
-        back to direct heading control toward origin).
-
         Runs synchronously — A* on this small map completes in <50 ms.
         """
         start_x = self.current_x
@@ -510,6 +535,9 @@ class WaypointNav(Node):
                 self.wp_index  = start_idx
 
             self.search_phase = 'TURNING'
+            # Reset stuck detector — fresh path means distance tracking restarts
+            self._wp_min_dist = float('inf')
+            self._stall_count  = 0
 
             self.get_logger().info(
                 f'Replan complete: {len(world_wps)} waypoints | '
@@ -529,11 +557,12 @@ class WaypointNav(Node):
 
     def _init_cube_finding(self):
         """Reset cube-finding sweep state before entering CUBE_FINDING."""
-        self.cf_phase        = 'ALIGN_NEG_X'
-        self.sweep_readings  = []
-        self.cube_target_yaw = None
-        self.sweep_last_yaw  = self.current_yaw
-        self.swept_total     = 0.0
+        self.cf_phase            = 'ALIGN_NEG_X'
+        self.sweep_readings      = []
+        self.cube_target_rel_yaw = None
+        self.sweep_start_yaw     = None
+        self.sweep_last_yaw      = self.current_yaw
+        self.swept_total         = 0.0
 
     # ── CONTROL LOOP (10 Hz) ──────────────────────────────────────────────────
 
@@ -581,10 +610,11 @@ class WaypointNav(Node):
                 return
 
             if self.replan_needed and not self.replanning:
-                self.stop()
-                if self._trigger_replan():
-                    self.state = 'WAITING_REPLAN'
-                return
+                # Fire the background replan but keep driving on the existing
+                # waypoints — the thread atomically swaps them when done (~50ms).
+                # Only the emergency stop (nearest_front < EMERGENCY_DIST) needs
+                # a hard stop; routine obstacle detection is 1.5m+ away.
+                self._trigger_replan()
 
             with self._wp_lock:
                 all_done = self.wp_index >= len(self.waypoints)
@@ -612,47 +642,76 @@ class WaypointNav(Node):
                 self.get_logger().info(
                     f'[DRIVING] wp {self.wp_index+1}/{n_wps}  dist={dist:.3f} m')
                 if dist < WAYPOINT_RADIUS:
-                    self.stop()
                     with self._wp_lock:
                         self.wp_index += 1
                         all_done = self.wp_index >= len(self.waypoints)
+                    # Reset stuck detector for the new target waypoint
+                    self._wp_min_dist = float('inf')
+                    self._stall_count  = 0
                     if all_done:
+                        self.stop()
                         self.get_logger().info('All waypoints reached — entering CUBE_FINDING')
                         self._init_cube_finding()
                         self.state = 'CUBE_FINDING'
                     else:
-                        self.search_phase = 'TURNING'
-                        self.get_logger().info(
-                            f'Waypoint reached — turning to waypoint {self.wp_index+1}')
+                        next_err = abs(self._heading_error())
+                        if next_err > WAYPOINT_TURN_THRESHOLD:
+                            self.stop()
+                            self.search_phase = 'TURNING'
+                            self.get_logger().info(
+                                f'Waypoint reached — large turn ({math.degrees(next_err):.0f}°), '
+                                f'stopping to align wp {self.wp_index+1}')
+                        else:
+                            self.get_logger().info(
+                                f'Waypoint reached — curving to wp {self.wp_index+1} '
+                                f'({math.degrees(next_err):.0f}°)')
                 else:
-                    # Proportional steering: curves toward waypoint while driving
-                    steer = max(-TURN_SPEED, min(TURN_SPEED, self._heading_error() * 2.0))
-                    self._publish_twist(FORWARD_SPEED, steer)
+                    # Stuck detector: if the robot hasn't closed the distance to
+                    # this waypoint by STALL_IMPROVE_M within STALL_TICKS ticks
+                    # (~2 s), it is likely circling an obstacle — force a replan
+                    # from the current position so A* finds a fresh route.
+                    if dist < self._wp_min_dist - STALL_IMPROVE_M:
+                        self._wp_min_dist = dist
+                        self._stall_count  = 0
+                    else:
+                        self._stall_count += 1
+                        if self._stall_count >= STALL_TICKS:
+                            self._stall_count  = 0
+                            self._wp_min_dist  = float('inf')
+                            self.get_logger().warn(
+                                f'Stuck at wp {self.wp_index+1} '
+                                f'(no progress for {STALL_TICKS} ticks) — forcing replan')
+                            self._trigger_replan()
+                    steer = max(-TURN_SPEED, min(TURN_SPEED,
+                                self._heading_error() * WAYPOINT_TRACKING_GAIN))
+                    self._drive_ramped(FORWARD_SPEED, steer)
 
         # ─────────────────────────────────────────────────────────────────────
         # CUBE_FINDING — structured sweep at the dead end
         #
         # ALIGN_NEG_X: face -120° (60° CCW from -X axis)
         # SWEEP:       rotate 120° CW through -X, recording red pixel counts
-        # ALIGN_CUBE:  rotate to face the angle with the most red pixels
+        #              as relative yaw offsets from sweep_start_yaw
+        # ALIGN_CUBE:  rotate to face cube using relative yaw from sweep start
         # APPROACH:    creep forward until cube fills the frame
         # ─────────────────────────────────────────────────────────────────────
         elif self.state == 'CUBE_FINDING':
 
             if self.cf_phase == 'ALIGN_NEG_X':
-                # -2π/3 = -120°: starting 60° CCW from -X so the sweep passes
-                # directly through -X at its midpoint
                 target_yaw = -2.0 * math.pi / 3.0
                 err = math.atan2(
                     math.sin(target_yaw - self.current_yaw),
                     math.cos(target_yaw - self.current_yaw))
                 if abs(err) < HEADING_TOL:
                     self.stop()
-                    self.sweep_last_yaw = self.current_yaw
-                    self.swept_total    = 0.0
-                    self.sweep_readings = []
+                    self.sweep_start_yaw = self.current_yaw
+                    self.sweep_last_yaw  = self.current_yaw
+                    self.swept_total     = 0.0
+                    self.sweep_readings  = []
                     self.cf_phase = 'SWEEP'
-                    self.get_logger().info('Aligned — starting 120° CW sweep around -X')
+                    self.get_logger().info(
+                        f'Aligned — starting 120° CW sweep around -X '
+                        f'(sweep_start_yaw={math.degrees(self.sweep_start_yaw):.1f}°)')
                 else:
                     self._publish_twist(0.0, CUBE_TURN_SPEED if err > 0 else -CUBE_TURN_SPEED)
 
@@ -662,31 +721,40 @@ class WaypointNav(Node):
                 if delta < -math.pi:  delta += 2 * math.pi
                 self.swept_total   += abs(delta)
                 self.sweep_last_yaw = self.current_yaw
-                self.sweep_readings.append((self.current_yaw, self.latest_red_pixels))
+
+                rel_yaw = math.atan2(
+                    math.sin(self.current_yaw - self.sweep_start_yaw),
+                    math.cos(self.current_yaw - self.sweep_start_yaw))
+                self.sweep_readings.append((rel_yaw, self.latest_red_pixels))
+
                 self.get_logger().info(
                     f'[SWEEP] swept={math.degrees(self.swept_total):.1f}°  '
+                    f'rel_yaw={math.degrees(rel_yaw):.1f}°  '
                     f'red_px={self.latest_red_pixels}')
 
                 if self.swept_total >= math.radians(SWEEP_DEG):
                     self.stop()
-                    above = [(yaw, px) for yaw, px in self.sweep_readings
+                    above = [(rel_yaw, px) for rel_yaw, px in self.sweep_readings
                              if px >= CUBE_PIXEL_THRESHOLD]
                     if above:
-                        self.cube_target_yaw = above[len(above) // 2][0]
+                        self.cube_target_rel_yaw = above[len(above) // 2][0]
                         self.get_logger().info(
-                            f'Sweep done — cube at '
-                            f'yaw={math.degrees(self.cube_target_yaw):.1f}°')
+                            f'Sweep done — cube at relative yaw '
+                            f'{math.degrees(self.cube_target_rel_yaw):.1f}° from sweep start')
                         self.cf_phase = 'ALIGN_CUBE'
                     else:
                         self.get_logger().warn('No cube detected during sweep — stopping')
                         self.state = 'DONE'
                 else:
-                    self._publish_twist(0.0, -CUBE_TURN_SPEED)   # CW = negative
+                    self._publish_twist(0.0, -CUBE_TURN_SPEED)
 
             elif self.cf_phase == 'ALIGN_CUBE':
+                current_rel = math.atan2(
+                    math.sin(self.current_yaw - self.sweep_start_yaw),
+                    math.cos(self.current_yaw - self.sweep_start_yaw))
                 err = math.atan2(
-                    math.sin(self.cube_target_yaw - self.current_yaw),
-                    math.cos(self.cube_target_yaw - self.current_yaw))
+                    math.sin(self.cube_target_rel_yaw - current_rel),
+                    math.cos(self.cube_target_rel_yaw - current_rel))
                 if abs(err) < HEADING_TOL:
                     self.stop()
                     self.cf_phase = 'APPROACH'
@@ -707,7 +775,6 @@ class WaypointNav(Node):
                         snap_path = os.path.join(MAP_DIR, 'cube_approach_snapshot.jpg')
                         cv2.imwrite(snap_path, self.latest_img)
                         self.get_logger().info(f'Approach snapshot saved to {snap_path}')
-                    # Plan return path on live map and start heading home
                     self.is_returning = True
                     if self._plan_return_path():
                         self.get_logger().info('Return path ready — beginning RETURNING')
@@ -716,11 +783,10 @@ class WaypointNav(Node):
                             'No A* return path — will head directly to (0,0)')
                     self.state = 'RETURNING'
                 else:
-                    self._publish_twist(CUBE_FWD_SPEED, 0.0)
+                    self._drive_ramped(CUBE_FWD_SPEED, 0.0)
 
         # ─────────────────────────────────────────────────────────────────────
         # DETECTED — cube seen during SEARCHING (immediate pixel-count trigger)
-        # Snapshot already saved above; plan return path and head home.
         # ─────────────────────────────────────────────────────────────────────
         elif self.state == 'DETECTED':
             self.stop()
@@ -730,18 +796,13 @@ class WaypointNav(Node):
                 self.state = 'RETURNING'
             else:
                 self.get_logger().warn('No A* return path — heading directly to (0,0)')
-                self.state = 'RETURNING'   # RETURNING handles direct-drive fallback
+                self.state = 'RETURNING'
 
         # ─────────────────────────────────────────────────────────────────────
         # RETURNING — follow A*-planned path back to (0,0)
-        #
-        # Uses the same TURNING/DRIVING sub-phases and proportional steering
-        # as SEARCHING. When planned waypoints are exhausted, drives directly
-        # toward (0,0) using heading error control as a final fallback.
         # ─────────────────────────────────────────────────────────────────────
         elif self.state == 'RETURNING':
 
-            # Close enough to origin — stop and align to original heading
             if self._distance_to_home() < HOME_RADIUS:
                 self.stop()
                 self.home_odom = (self.current_x, self.current_y)
@@ -755,7 +816,6 @@ class WaypointNav(Node):
                 n_wps    = len(self.waypoints)
 
             if all_done:
-                # All planned waypoints passed but not home yet — drive directly
                 err = self._heading_error_to_xy(0.0, 0.0)
                 self.get_logger().info(
                     f'[RETURNING/DIRECT] dist={self._distance_to_home():.3f} m  '
@@ -763,7 +823,7 @@ class WaypointNav(Node):
                 if abs(err) > HEADING_TOL:
                     self._publish_twist(0.0, TURN_SPEED if err > 0 else -TURN_SPEED)
                 else:
-                    self._publish_twist(FORWARD_SPEED, 0.0)
+                    self._drive_ramped(FORWARD_SPEED, 0.0)
                 return
 
             if self.search_phase == 'TURNING':
@@ -782,13 +842,17 @@ class WaypointNav(Node):
                 self.get_logger().info(
                     f'[RETURNING/DRIVING] wp {self.wp_index+1}/{n_wps}  dist={dist:.3f} m')
                 if dist < WAYPOINT_RADIUS:
-                    self.stop()
                     with self._wp_lock:
                         self.wp_index += 1
-                    self.search_phase = 'TURNING'
+                        all_done = self.wp_index >= len(self.waypoints)
+                    if not all_done:
+                        next_err = abs(self._heading_error())
+                        if next_err > WAYPOINT_TURN_THRESHOLD:
+                            self.stop()
+                            self.search_phase = 'TURNING'
                 else:
                     steer = max(-TURN_SPEED, min(TURN_SPEED, self._heading_error() * 2.0))
-                    self._publish_twist(FORWARD_SPEED, steer)
+                    self._drive_ramped(FORWARD_SPEED, steer)
 
         # ─────────────────────────────────────────────────────────────────────
         # ALIGNING_HOME — rotate to face yaw=0 (original heading at run start)
@@ -828,10 +892,6 @@ class WaypointNav(Node):
 # ── POST-RUN OVERLAY ──────────────────────────────────────────────────────────
 
 def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
-    """
-    Draw the robot's odometry trail on the Phase 1 SLAM map.
-    Outbound trail = orange, return trail = green, with a legend.
-    """
     pgm_path  = os.path.join(map_dir, 'map.pgm')
     yaml_path = os.path.join(map_dir, 'map.yaml')
     if not os.path.exists(pgm_path) or not os.path.exists(yaml_path):
@@ -855,8 +915,8 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
         row = h - int(round((wy - origin[1]) / resolution))
         return col * scale, row * scale
 
-    OUTBOUND_COLOUR = (0, 200, 255)    # orange
-    RETURN_COLOUR   = (120, 255, 120)  # green
+    OUTBOUND_COLOUR = (0, 200, 255)
+    RETURN_COLOUR   = (120, 255, 120)
 
     if outbound_trail and len(outbound_trail) > 1:
         pts = [world_to_px(x, y) for x, y in outbound_trail]
@@ -868,7 +928,6 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
         for i in range(len(pts) - 1):
             cv2.line(vis, pts[i], pts[i+1], RETURN_COLOUR, 2)
 
-    # Fall back to single-colour trail if no split data
     if not outbound_trail and not return_trail and len(trail) > 1:
         pts = [world_to_px(x, y) for x, y in trail]
         for i in range(len(pts) - 1):
@@ -884,7 +943,6 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
         cv2.putText(vis, 'end',   (ex+6, ey-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    # Legend
     lx, ly = 8, 8
     cv2.rectangle(vis, (lx, ly), (lx+160, ly+50), (40, 40, 40), -1)
     cv2.line(vis, (lx+6, ly+15), (lx+26, ly+15), OUTBOUND_COLOUR, 2)

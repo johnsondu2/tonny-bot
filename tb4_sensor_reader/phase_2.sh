@@ -24,6 +24,12 @@ set-turtlebot $TB_NUM
 
 sleep 1
 
+echo "Undocking..."
+
+ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
+
+sleep 10
+
 # This must output x: 0.0, y: 0.0
 gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; ros2 service call /$TB/reset_pose irobot_create_msgs/srv/ResetPose {}; sleep 1; ros2 topic echo /$TB/odom --field pose.pose.position --once; exec bash"
 
