@@ -532,7 +532,12 @@ class WaypointNav(Node):
                         self.get_logger().info(
                             f'Waypoint reached — turning to waypoint {self.wp_index+1}')
                 else:
-                    self._publish_twist(FORWARD_SPEED, 0.0)
+                    # Proportional steering while driving — curves toward the
+                    # waypoint rather than stopping to realign. The gain of 2.0
+                    # means a 10° error produces 0.35 rad/s correction.
+                    # Clamped to ±TURN_SPEED so it never spins in place.
+                    steer = max(-TURN_SPEED, min(TURN_SPEED, self._heading_error() * 2.0))
+                    self._publish_twist(FORWARD_SPEED, steer)
 
         elif self.state == 'CUBE_FINDING':
 
