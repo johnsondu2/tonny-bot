@@ -26,7 +26,7 @@ echo "Undocking..."
 
 ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
 
-sleep 15
+sleep 5
 
 echo "Launching SLAM..."
 gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; ros2 service call /$TB/reset_pose irobot_create_msgs/srv/ResetPose {}; ros2 launch turtlebot4_navigation slam.launch.py namespace:=/$TB; exec bash"

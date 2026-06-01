@@ -49,7 +49,7 @@ WAYPOINT_TRACKING_GAIN  = 4.0
 # Stuck detector: if the robot hasn't closed the distance to the current
 # waypoint by STALL_IMPROVE_M within STALL_TICKS control ticks (~2 s at 10 Hz),
 # it is assumed to be circling an obstacle and a fresh replan is forced.
-STALL_TICKS    = 20
+STALL_TICKS     = 20
 STALL_IMPROVE_M = 0.02
 RED_LOW1  = np.array([0,   120, 70])
 RED_HIGH1 = np.array([10,  255, 255])
@@ -79,6 +79,7 @@ class WaypointNav(Node):
 
         self.current_x   = 0.0
         self.current_y   = 0.0
+        self.current_z   = 0.0
         self.current_yaw = 0.0
         self.odom_trail      = []
         self.outbound_trail  = []
@@ -89,8 +90,9 @@ class WaypointNav(Node):
         self.latest_red_pixels = 0
         self.latest_img        = None
 
-        self.cube_odom = None
-        self.home_odom = None
+        self.cube_odom      = None   # (x, y) robot position at detection
+        self.cube_world_pos = None   # (x, y) estimated actual cube position
+        self.home_odom      = None   # (x, y, z) robot position when home reached
 
         self.map_resolution   = None
         self.map_origin       = None
@@ -111,6 +113,9 @@ class WaypointNav(Node):
         # or receive a fresh replan. See STALL_TICKS / STALL_IMPROVE_M.
         self._wp_min_dist  = float('inf')
         self._stall_count  = 0
+        # Numbered live-map saves: incremented each time _replan_thread
+        # completes so every replan produces a non-overwriting archive image.
+        self._replan_count = 0
 
         self.replan_needed = False
         self.replanning    = False
@@ -132,6 +137,10 @@ class WaypointNav(Node):
         self.state = 'SEARCHING'
 
         self._load_and_plan()
+
+        # Save the initial plan before the robot moves (live_map_001.png)
+        self._replan_count += 1
+        self._save_live_map(replan_index=self._replan_count)
 
         self.timer = self.create_timer(0.1, self.control_loop)
         self.get_logger().info('=== Autonomous search node started ===')
@@ -252,6 +261,7 @@ class WaypointNav(Node):
     def odom_callback(self, msg):
         self.current_x = msg.pose.pose.position.x
         self.current_y = msg.pose.pose.position.y
+        self.current_z = msg.pose.pose.position.z
         q = msg.pose.pose.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -330,6 +340,18 @@ class WaypointNav(Node):
         target = math.atan2(dy, dx)
         err    = target - self.current_yaw
         return math.atan2(math.sin(err), math.cos(err))
+
+    def _estimate_cube_pos(self):
+        """
+        Estimate the cube's world (x, y) position at the moment of detection.
+        The cube is assumed to be 0.24 m directly in front of the robot,
+        derived from the robot's current odometry position and heading.
+            cube_x = robot_x + 0.24 * cos(yaw)
+            cube_y = robot_y + 0.24 * sin(yaw)
+        """
+        cx = self.current_x + 0.24 * math.cos(self.current_yaw)
+        cy = self.current_y + 0.24 * math.sin(self.current_yaw)
+        return cx, cy
 
     def _path_blocked(self):
         with self._wp_lock:
@@ -416,10 +438,23 @@ class WaypointNav(Node):
 
         self.get_logger().info(
             f'Return path planned: {len(world_wps)} waypoints → (0,0)')
+
+        # Save a numbered archive snapshot showing the return path overlaid
+        # on the live map, so the return plan is preserved alongside the
+        # outbound replan sequence (live_map_001.png, 002.png, …)
+        self._replan_count += 1
+        self._save_live_map(replan_index=self._replan_count)
+
         return True
 
-    def _save_live_map(self):
-        """Save current live map state to ~/Downloads/map/live_map.png."""
+    def _save_live_map(self, replan_index=None):
+        """
+        Save current live map state.
+
+        Always writes ~/Downloads/map/live_map.png (the 'latest' view).
+        When replan_index is provided (1, 2, 3 …) also writes a non-
+        overwriting archive copy:  live_map_001.png, live_map_002.png, …
+        """
         try:
             pgm_path  = os.path.join(MAP_DIR, 'map.pgm')
             yaml_path = os.path.join(MAP_DIR, 'map.yaml')
@@ -439,11 +474,14 @@ class WaypointNav(Node):
             vis   = cv2.resize(vis, (w * scale, h * scale),
                                interpolation=cv2.INTER_NEAREST)
 
+            # Red squares for Phase 2 obstacles (cells free in Phase 1 map
+            # but now marked occupied in the live grid)
             if self.phase1_navigable is not None:
                 new_obs = (self.phase1_navigable == 1) & (self.live_grid == 0)
                 for r, c in zip(*np.where(new_obs)):
                     vis[r*scale:(r+1)*scale, c*scale:(c+1)*scale] = (0, 0, 255)
 
+            # Cyan dots = remaining waypoints, grey = already passed
             with self._wp_lock:
                 wps = list(self.waypoints)
                 idx = self.wp_index
@@ -454,6 +492,7 @@ class WaypointNav(Node):
                     colour = (0, 220, 220) if i >= idx else (100, 100, 100)
                     cv2.circle(vis, (col*scale, row*scale), 4, colour, -1)
 
+            # Green dot = current robot position
             rx_col = int(round((self.current_x - origin[0]) / resolution))
             rx_row = h - int(round((self.current_y - origin[1]) / resolution))
             if 0 <= rx_row < h and 0 <= rx_col < w:
@@ -461,7 +500,13 @@ class WaypointNav(Node):
                 cv2.putText(vis, 'robot', (rx_col*scale + 8, rx_row*scale - 6),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (60, 220, 60), 1)
 
+            # Always overwrite the 'latest' file
             cv2.imwrite(os.path.join(MAP_DIR, 'live_map.png'), vis)
+
+            # Also write a numbered archive copy so no replan is ever lost
+            if replan_index is not None:
+                archive = os.path.join(MAP_DIR, f'live_map_{replan_index:03d}.png')
+                cv2.imwrite(archive, vis)
 
         except Exception as e:
             self.get_logger().warn(f'live map save failed: {e}')
@@ -545,7 +590,9 @@ class WaypointNav(Node):
                 f'goal ({world_wps[-1][0]:.2f}, {world_wps[-1][1]:.2f}) | '
                 f'resuming from wp {start_idx+1}/{len(world_wps)}')
 
-            self._save_live_map()
+            # Increment counter and save both live_map.png and live_map_NNN.png
+            self._replan_count += 1
+            self._save_live_map(replan_index=self._replan_count)
 
         except Exception as e:
             self.get_logger().error(f'Replan thread error: {e}')
@@ -557,6 +604,11 @@ class WaypointNav(Node):
 
     def _init_cube_finding(self):
         """Reset cube-finding sweep state before entering CUBE_FINDING."""
+        # Save a numbered snapshot the moment all waypoints are reached so
+        # the final obstacle state going into the cube sweep is archived.
+        self._replan_count += 1
+        self._save_live_map(replan_index=self._replan_count)
+
         self.cf_phase            = 'ALIGN_NEG_X'
         self.sweep_readings      = []
         self.cube_target_rel_yaw = None
@@ -598,10 +650,15 @@ class WaypointNav(Node):
 
             if self.cube_detected:
                 self.stop()
-                self.cube_odom = (self.current_x, self.current_y)
+                self.cube_odom      = (self.current_x, self.current_y)
+                self.cube_world_pos = self._estimate_cube_pos()
                 self.get_logger().info(
-                    f'RED CUBE DETECTED at odometry '
-                    f'x={self.current_x:.3f} m  y={self.current_y:.3f} m')
+                    f'RED CUBE DETECTED — robot odometry: '
+                    f'x={self.current_x:.3f} m  y={self.current_y:.3f} m  '
+                    f'yaw={math.degrees(self.current_yaw):.1f}°')
+                self.get_logger().info(
+                    f'Estimated cube world position (0.24 m ahead): '
+                    f'x={self.cube_world_pos[0]:.3f} m  y={self.cube_world_pos[1]:.3f} m')
                 if self.latest_img is not None:
                     snap_path = os.path.join(MAP_DIR, 'detection_snapshot.jpg')
                     cv2.imwrite(snap_path, self.latest_img)
@@ -767,10 +824,15 @@ class WaypointNav(Node):
                     f'[APPROACH] red_px={self.latest_red_pixels} (stop at {CUBE_STOP_PIXELS})')
                 if self.latest_red_pixels >= CUBE_STOP_PIXELS:
                     self.stop()
-                    self.cube_odom = (self.current_x, self.current_y)
+                    self.cube_odom      = (self.current_x, self.current_y)
+                    self.cube_world_pos = self._estimate_cube_pos()
                     self.get_logger().info(
-                        f'Cube reached — estimated position: '
-                        f'x={self.current_x:.3f} m  y={self.current_y:.3f} m')
+                        f'Cube reached — robot odometry: '
+                        f'x={self.current_x:.3f} m  y={self.current_y:.3f} m  '
+                        f'yaw={math.degrees(self.current_yaw):.1f}°')
+                    self.get_logger().info(
+                        f'Estimated cube world position (0.24 m ahead): '
+                        f'x={self.cube_world_pos[0]:.3f} m  y={self.cube_world_pos[1]:.3f} m')
                     if self.latest_img is not None:
                         snap_path = os.path.join(MAP_DIR, 'cube_approach_snapshot.jpg')
                         cv2.imwrite(snap_path, self.latest_img)
@@ -805,7 +867,7 @@ class WaypointNav(Node):
 
             if self._distance_to_home() < HOME_RADIUS:
                 self.stop()
-                self.home_odom = (self.current_x, self.current_y)
+                self.home_odom = (self.current_x, self.current_y, self.current_z)
                 self.get_logger().info(
                     'Home reached — aligning to original heading (yaw=0°)')
                 self.state = 'ALIGNING_HOME'
@@ -876,22 +938,61 @@ class WaypointNav(Node):
             elapsed = time.time() - self.start_time
             mins    = int(elapsed // 60)
             secs    = int(elapsed % 60)
-            self.get_logger().info(f'=== RUN COMPLETE === Total time: {mins}m {secs}s')
+
+            lines = [
+                '=== RUN COMPLETE ===',
+                f'Total run time : {mins}m {secs}s',
+                '',
+            ]
+
             if self.cube_odom:
-                self.get_logger().info(
-                    f'Cube position:  x={self.cube_odom[0]:.3f}  y={self.cube_odom[1]:.3f}')
+                lines.append(
+                    f'Robot position at detection  : '
+                    f'x={self.cube_odom[0]:.3f} m  y={self.cube_odom[1]:.3f} m')
+            if self.cube_world_pos:
+                lines.append(
+                    f'Estimated cube world position: '
+                    f'x={self.cube_world_pos[0]:.3f} m  y={self.cube_world_pos[1]:.3f} m  '
+                    f'(0.24 m ahead of robot at detection)')
+
+            lines.append('')
+
             if self.home_odom:
-                self.get_logger().info(
-                    f'Home reached:   x={self.home_odom[0]:.3f}  y={self.home_odom[1]:.3f}  '
+                lines.append(
+                    f'Home reached (odometry)      : '
+                    f'x={self.home_odom[0]:.3f} m  '
+                    f'y={self.home_odom[1]:.3f} m  '
+                    f'z={self.home_odom[2]:.3f} m  '
                     f'(error {self._distance_to_home():.3f} m from origin)')
             else:
-                self.get_logger().info(
-                    f'Final position: x={self.current_x:.3f}  y={self.current_y:.3f}')
+                lines.append(
+                    f'Final position               : '
+                    f'x={self.current_x:.3f} m  y={self.current_y:.3f} m')
+
+            for line in lines:
+                self.get_logger().info(line)
+
+            # Save identical summary to ~/Downloads/map/run_summary.txt
+            try:
+                summary_path = os.path.join(MAP_DIR, 'run_summary.txt')
+                with open(summary_path, 'w') as f:
+                    f.write('\n'.join(lines) + '\n')
+                self.get_logger().info(f'Run summary saved → {summary_path}')
+            except Exception as e:
+                self.get_logger().warn(f'Could not save run summary: {e}')
 
 
 # ── POST-RUN OVERLAY ──────────────────────────────────────────────────────────
 
-def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
+def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None,
+                  live_grid=None, phase1_navigable=None,
+                  map_origin=None, map_resolution=None, map_h=None):
+    """
+    Save odom_overlay.png with outbound (orange) and return (green) trails.
+    If live_grid and phase1_navigable are provided, also paints red squares
+    for every cell that was free in the Phase 1 map but is now occupied —
+    i.e. the Phase 2 obstacles the robot detected during the run.
+    """
     pgm_path  = os.path.join(map_dir, 'map.pgm')
     yaml_path = os.path.join(map_dir, 'map.yaml')
     if not os.path.exists(pgm_path) or not os.path.exists(yaml_path):
@@ -910,13 +1011,21 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
     vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     vis = cv2.resize(vis, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
 
+    # ── Obstacle overlay (drawn first so trails render on top) ────────────────
+    if live_grid is not None and phase1_navigable is not None:
+        new_obs = (phase1_navigable == 1) & (live_grid == 0)
+        obs_rows, obs_cols = np.where(new_obs)
+        for r, c in zip(obs_rows, obs_cols):
+            vis[r*scale:(r+1)*scale, c*scale:(c+1)*scale] = (0, 0, 255)
+
+    # ── Trail lines ───────────────────────────────────────────────────────────
     def world_to_px(wx, wy):
         col = int(round((wx - origin[0]) / resolution))
         row = h - int(round((wy - origin[1]) / resolution))
         return col * scale, row * scale
 
-    OUTBOUND_COLOUR = (0, 200, 255)
-    RETURN_COLOUR   = (120, 255, 120)
+    OUTBOUND_COLOUR = (0, 200, 255)   # orange
+    RETURN_COLOUR   = (120, 255, 120) # green
 
     if outbound_trail and len(outbound_trail) > 1:
         pts = [world_to_px(x, y) for x, y in outbound_trail]
@@ -933,6 +1042,7 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
         for i in range(len(pts) - 1):
             cv2.line(vis, pts[i], pts[i+1], OUTBOUND_COLOUR, 2)
 
+    # ── Start / end markers ───────────────────────────────────────────────────
     if trail:
         sx, sy = world_to_px(*trail[0])
         ex, ey = world_to_px(*trail[-1])
@@ -943,14 +1053,50 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None):
         cv2.putText(vis, 'end',   (ex+6, ey-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    lx, ly = 8, 8
-    cv2.rectangle(vis, (lx, ly), (lx+160, ly+50), (40, 40, 40), -1)
+    # ── Legend — placed dynamically in the grey (unknown) area outside the arena ──
+    # Grey pixels in the ROS pgm (value 51–229) are unknown space outside the
+    # navigable corridor. We score five candidate positions by how many grey
+    # pixels they cover and pick the one with the highest score, so the legend
+    # lands in a grey margin rather than on top of the map itself.
+    legend_w   = 168
+    legend_h   = 70 if (live_grid is not None) else 50
+
+    # Build a scaled binary mask: 1 where the original pgm pixel is grey
+    grey_orig   = (img > 50) & (img < 230)
+    grey_scaled = np.kron(grey_orig.astype(np.uint8),
+                          np.ones((scale, scale), dtype=np.uint8))
+    img_h_sc, img_w_sc = grey_scaled.shape
+
+    candidates = [
+        (8,                    8),                               # top-left
+        (8,                    img_h_sc // 2 - legend_h // 2),  # left-centre
+        (8,                    img_h_sc - legend_h - 8),        # bottom-left
+        (img_w_sc - legend_w - 8, 8),                           # top-right
+        (img_w_sc - legend_w - 8, img_h_sc // 2 - legend_h // 2),  # right-centre
+        (img_w_sc - legend_w - 8, img_h_sc - legend_h - 8),    # bottom-right
+    ]
+
+    lx, ly     = 8, 8   # fallback
+    best_score = -1
+    for cx, cy in candidates:
+        if cx < 0 or cy < 0 or cx + legend_w > img_w_sc or cy + legend_h > img_h_sc:
+            continue
+        score = int(np.sum(grey_scaled[cy:cy + legend_h, cx:cx + legend_w]))
+        if score > best_score:
+            best_score = score
+            lx, ly = cx, cy
+
+    cv2.rectangle(vis, (lx, ly), (lx + legend_w, ly + legend_h), (40, 40, 40), -1)
     cv2.line(vis, (lx+6, ly+15), (lx+26, ly+15), OUTBOUND_COLOUR, 2)
     cv2.putText(vis, 'Outbound', (lx+32, ly+20),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, OUTBOUND_COLOUR, 1)
     cv2.line(vis, (lx+6, ly+35), (lx+26, ly+35), RETURN_COLOUR, 2)
     cv2.putText(vis, 'Returning', (lx+32, ly+40),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, RETURN_COLOUR, 1)
+    if live_grid is not None:
+        cv2.rectangle(vis, (lx+6, ly+50), (lx+26, ly+62), (0, 0, 255), -1)
+        cv2.putText(vis, 'Obstacle', (lx+32, ly+61),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
 
     out_path = os.path.join(map_dir, 'odom_overlay.png')
     cv2.imwrite(out_path, vis)
@@ -965,8 +1111,16 @@ def main(args=None):
     try:
         rclpy.spin(node)
     finally:
-        save_odom_map(node.odom_trail, MAP_DIR,
-                      node.outbound_trail, node.return_trail)
+        save_odom_map(
+            node.odom_trail, MAP_DIR,
+            outbound_trail=node.outbound_trail,
+            return_trail=node.return_trail,
+            live_grid=node.live_grid,
+            phase1_navigable=node.phase1_navigable,
+            map_origin=node.map_origin,
+            map_resolution=node.map_resolution,
+            map_h=node.map_h,
+        )
         node._save_live_map()
         cv2.destroyAllWindows()
         node.destroy_node()
