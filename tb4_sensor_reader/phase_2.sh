@@ -28,11 +28,11 @@ ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
 sleep 1
 
 # This must output x: 0.0, y: 0.0
-gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; ros2 service call /$TB/reset_pose irobot_create_msgs/srv/ResetPose {}; sleep 1; ros2 topic echo /$TB/odom --field pose.pose.position --once; exec bash"
+gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_ws/install/setup.bash; set-turtlebot 21; ros2 service call /T21/reset_pose irobot_create_msgs/srv/ResetPose {}; sleep 1; ros2 topic echo /T21/odom --field pose.pose.position --once; exec bash"
 
 sleep 2
 
-gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_venv/bin/activate; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; echo ''; read -p 'Press Enter to start autonomous search...' _; ~/ros2_venv/bin/python3 -m tb4_sensor_reader.autonomous_search; exec bash"
+gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_venv/bin/activate; source ~/ros2_ws/install/setup.bash; set-turtlebot 21; echo ''; read -p 'Press Enter to start autonomous search...' _; ~/ros2_venv/bin/python3 -m tb4_sensor_reader.autonomous_search; exec bash"
 
 echo "Robot is now in autonomous navigation mode."
 

@@ -154,7 +154,8 @@ def find_dead_end(navigable, dist_map, start):
 
     # Pick the local maximum with the highest Dijkstra cost from start
     # = deepest into the corridor centre
-    dead_end = max(local_maxima, key=lambda rc: dijkstra[rc[0], rc[1]])
+    # also ensures it doesn't pick dead end position as a narrow gap near the cylinders
+    dead_end = max(local_maxima, key=lambda rc: dijkstra[rc[0], rc[1]] * (dist_map[rc[0], rc[1]] ** 0.5))
     return dead_end
 
 
