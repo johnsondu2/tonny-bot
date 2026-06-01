@@ -1,22 +1,24 @@
-import rclpy
+import rclpy, cv2
+import numpy as np
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
-from cv_bridge import CvBridge
-import cv2
+from rclpy.qos import qos_profile_sensor_data
 
-NAMESPACE = '/T29'   # ← change to your robot namespace
+NAMESPACE = '/T21'
 
 class CameraViewer(Node):
     def __init__(self):
         super().__init__('camera_viewer')
-        self.bridge = CvBridge()
         topic = f'{NAMESPACE}/oakd/rgb/image_raw/compressed'
         self.create_subscription(
-            CompressedImage, topic, self.image_callback, 10)
-        self.get_logger().info(f'Camera viewer started — topic: {topic}')
+            CompressedImage, topic, self.image_callback, qos_profile_sensor_data)
+        self.get_logger().info(f'Camera viewer started — {topic}')
 
     def image_callback(self, msg):
-        img = self.bridge.compressed_imgmsg_to_cv2(msg, 'bgr8')
+        buf = np.frombuffer(msg.data, dtype=np.uint8)
+        img = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if img is None:
+            return
         cv2.imshow('Camera', img)
         cv2.waitKey(1)
 
