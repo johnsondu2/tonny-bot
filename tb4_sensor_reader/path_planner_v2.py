@@ -36,7 +36,7 @@ OUT_IMG  = os.path.join(MAP_DIR, "path_output.png")
 
 # How strongly to prefer corridor centres vs raw distance.
 # Higher = tighter centre-hugging. 25.0 works well for most arenas.
-CENTRE_WEIGHT = 2000.0
+CENTRE_WEIGHT = 5000.0
 
 # Waypoint spacing: keep every Nth cell (N * resolution = metres between waypoints).
 # 5 * 0.05 m = 0.25 m between waypoints.

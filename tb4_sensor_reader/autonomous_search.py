@@ -17,12 +17,12 @@ from tb4_sensor_reader.path_planner_v2 import (
     WAYPOINT_STEP, CENTRE_WEIGHT,
 )
 
-NAMESPACE        = '/T10'
+NAMESPACE        = '/T18'
 FORWARD_SPEED    = 0.15
 TURN_SPEED       = 0.5
 FRONT_ARC_DEG    = 60
 FRONT_OFFSET_DEG = -90.0
-REPLAN_COOLDOWN_S = 3.0
+REPLAN_COOLDOWN_S = 5.0          # increased from 3.0 — reduces replan cascading
 MAP_DIR          = os.path.expanduser('~/Downloads/map')
 WAYPOINT_RADIUS  = 0.1
 HOME_RADIUS      = 0.10
@@ -33,8 +33,18 @@ REPLAN_NEARBY_M  = 1.5
 REPLAN_LOOKAHEAD = 5
 SCAN_SAMPLE_RATE = 4
 SCAN_MAX_RANGE_M = 4.0
-MIN_NEW_OBS_DIST_PX = 3
-HIT_THRESHOLD       = 3
+MIN_NEW_OBS_DIST_PX  = 3        # first-pass wall-proximity filter (unchanged)
+HIT_THRESHOLD        = 4        # increased from 3 — require more consistent hits
+# ── Range-comparison filter ────────────────────────────────────────────────
+# A LiDAR hit is only counted as a new obstacle if the actual range is at
+# least RANGE_NEW_OBS_TOLERANCE metres SHORTER than the Phase 1 map predicts
+# for that ray direction.  Wall re-detections caused by odometry/SLAM frame
+# offset read only ~0–10 cm shorter than expected and are therefore skipped.
+# Real Phase 2 obstacles sitting in front of the wall read much shorter.
+# Tune UP toward 0.15 if false wall detections persist.
+# Tune DOWN toward 0.08 if a real obstacle very close to a wall is missed.
+RANGE_NEW_OBS_TOLERANCE = 0.12  # metres
+
 MIN_PIXELS           = 500000
 CUBE_PIXEL_THRESHOLD = 2000
 CUBE_STOP_PIXELS     = 25000
@@ -237,6 +247,17 @@ class WaypointNav(Node):
                 continue
             if self.phase1_dist[row, col] < MIN_NEW_OBS_DIST_PX:
                 continue
+
+            # ── Range-comparison filter ────────────────────────────────────
+            # Ray-cast through the Phase 1 map to find the expected range in
+            # this direction.  Skip this hit if the actual reading is within
+            # RANGE_NEW_OBS_TOLERANCE of the expected wall range — that means
+            # the LiDAR is just re-seeing a Phase 1 wall shifted slightly by
+            # the SLAM/odometry frame offset, not a new Phase 2 obstacle.
+            expected_r = self._expected_range_from_map(world_angle)
+            if r >= expected_r - RANGE_NEW_OBS_TOLERANCE:
+                continue  # actual ≈ Phase 1 prediction → not a new obstacle
+
             self.hit_counts[row, col] += 1
             if self.hit_counts[row, col] >= HIT_THRESHOLD:
                 self.live_grid[row, col] = 0
@@ -245,6 +266,9 @@ class WaypointNav(Node):
         if not new_obstacles_found:
             return
 
+        # With the range filter above, new_obstacles_found contains only real
+        # Phase 2 obstacles (not wall re-detections), so the proximity trigger
+        # is safe to use — it won't fire on false hits anymore.
         should_replan = False
         for row, col in new_obstacles_found:
             ox, oy = pixel_to_world(row, col,
@@ -292,6 +316,36 @@ class WaypointNav(Node):
     def stop(self):
         self._cmd_speed = 0.0
         self.pub.publish(Twist())
+
+    def _expected_range_from_map(self, world_angle):
+        """
+        Ray-cast through the Phase 1 navigable map from the robot's current
+        odometry position along world_angle.
+
+        Returns the distance in metres to the nearest Phase 1 wall cell.
+        Steps one map pixel at a time up to SCAN_MAX_RANGE_M.
+
+        Used by scan_callback to distinguish genuine new obstacles (reading
+        significantly shorter than expected) from wall re-detections caused
+        by the small SLAM/odometry frame offset (reading ≈ expected).
+        """
+        step_m    = self.map_resolution          # one pixel per step
+        max_steps = int(SCAN_MAX_RANGE_M / step_m)
+        cos_a = math.cos(world_angle)
+        sin_a = math.sin(world_angle)
+        ox = self.current_x
+        oy = self.current_y
+        for s in range(1, max_steps + 1):
+            dist = s * step_m
+            col = int(round((ox + dist * cos_a - self.map_origin[0])
+                            / self.map_resolution))
+            row = self.map_h - int(round((oy + dist * sin_a - self.map_origin[1])
+                                         / self.map_resolution))
+            if not (0 <= row < self.map_h and 0 <= col < self.map_w):
+                return dist                      # ray left the map boundary
+            if self.phase1_navigable[row, col] == 0:
+                return dist                      # hit a Phase 1 wall cell
+        return SCAN_MAX_RANGE_M                  # nothing found within range
 
     def _drive_ramped(self, target_speed, steer):
         """
@@ -439,9 +493,6 @@ class WaypointNav(Node):
         self.get_logger().info(
             f'Return path planned: {len(world_wps)} waypoints → (0,0)')
 
-        # Save a numbered archive snapshot showing the return path overlaid
-        # on the live map, so the return plan is preserved alongside the
-        # outbound replan sequence (live_map_001.png, 002.png, …)
         self._replan_count += 1
         self._save_live_map(replan_index=self._replan_count)
 
@@ -604,8 +655,6 @@ class WaypointNav(Node):
 
     def _init_cube_finding(self):
         """Reset cube-finding sweep state before entering CUBE_FINDING."""
-        # Save a numbered snapshot the moment all waypoints are reached so
-        # the final obstacle state going into the cube sweep is archived.
         self._replan_count += 1
         self._save_live_map(replan_index=self._replan_count)
 
@@ -667,10 +716,6 @@ class WaypointNav(Node):
                 return
 
             if self.replan_needed and not self.replanning:
-                # Fire the background replan but keep driving on the existing
-                # waypoints — the thread atomically swaps them when done (~50ms).
-                # Only the emergency stop (nearest_front < EMERGENCY_DIST) needs
-                # a hard stop; routine obstacle detection is 1.5m+ away.
                 self._trigger_replan()
 
             with self._wp_lock:
@@ -702,7 +747,6 @@ class WaypointNav(Node):
                     with self._wp_lock:
                         self.wp_index += 1
                         all_done = self.wp_index >= len(self.waypoints)
-                    # Reset stuck detector for the new target waypoint
                     self._wp_min_dist = float('inf')
                     self._stall_count  = 0
                     if all_done:
@@ -723,10 +767,6 @@ class WaypointNav(Node):
                                 f'Waypoint reached — curving to wp {self.wp_index+1} '
                                 f'({math.degrees(next_err):.0f}°)')
                 else:
-                    # Stuck detector: if the robot hasn't closed the distance to
-                    # this waypoint by STALL_IMPROVE_M within STALL_TICKS ticks
-                    # (~2 s), it is likely circling an obstacle — force a replan
-                    # from the current position so A* finds a fresh route.
                     if dist < self._wp_min_dist - STALL_IMPROVE_M:
                         self._wp_min_dist = dist
                         self._stall_count  = 0
@@ -745,12 +785,6 @@ class WaypointNav(Node):
 
         # ─────────────────────────────────────────────────────────────────────
         # CUBE_FINDING — structured sweep at the dead end
-        #
-        # ALIGN_NEG_X: face -120° (60° CCW from -X axis)
-        # SWEEP:       rotate 120° CW through -X, recording red pixel counts
-        #              as relative yaw offsets from sweep_start_yaw
-        # ALIGN_CUBE:  rotate to face cube using relative yaw from sweep start
-        # APPROACH:    creep forward until cube fills the frame
         # ─────────────────────────────────────────────────────────────────────
         elif self.state == 'CUBE_FINDING':
 
@@ -972,7 +1006,6 @@ class WaypointNav(Node):
             for line in lines:
                 self.get_logger().info(line)
 
-            # Save identical summary to ~/Downloads/map/run_summary.txt
             try:
                 summary_path = os.path.join(MAP_DIR, 'run_summary.txt')
                 with open(summary_path, 'w') as f:
@@ -989,9 +1022,6 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None,
                   map_origin=None, map_resolution=None, map_h=None):
     """
     Save odom_overlay.png with outbound (orange) and return (green) trails.
-    If live_grid and phase1_navigable are provided, also paints red squares
-    for every cell that was free in the Phase 1 map but is now occupied —
-    i.e. the Phase 2 obstacles the robot detected during the run.
     """
     pgm_path  = os.path.join(map_dir, 'map.pgm')
     yaml_path = os.path.join(map_dir, 'map.yaml')
@@ -1011,21 +1041,19 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None,
     vis = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     vis = cv2.resize(vis, (w * scale, h * scale), interpolation=cv2.INTER_NEAREST)
 
-    # ── Obstacle overlay (drawn first so trails render on top) ────────────────
     if live_grid is not None and phase1_navigable is not None:
         new_obs = (phase1_navigable == 1) & (live_grid == 0)
         obs_rows, obs_cols = np.where(new_obs)
         for r, c in zip(obs_rows, obs_cols):
             vis[r*scale:(r+1)*scale, c*scale:(c+1)*scale] = (0, 0, 255)
 
-    # ── Trail lines ───────────────────────────────────────────────────────────
     def world_to_px(wx, wy):
         col = int(round((wx - origin[0]) / resolution))
         row = h - int(round((wy - origin[1]) / resolution))
         return col * scale, row * scale
 
-    OUTBOUND_COLOUR = (0, 200, 255)   # orange
-    RETURN_COLOUR   = (120, 255, 120) # green
+    OUTBOUND_COLOUR = (0, 200, 255)
+    RETURN_COLOUR   = (120, 255, 120)
 
     if outbound_trail and len(outbound_trail) > 1:
         pts = [world_to_px(x, y) for x, y in outbound_trail]
@@ -1042,7 +1070,6 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None,
         for i in range(len(pts) - 1):
             cv2.line(vis, pts[i], pts[i+1], OUTBOUND_COLOUR, 2)
 
-    # ── Start / end markers ───────────────────────────────────────────────────
     if trail:
         sx, sy = world_to_px(*trail[0])
         ex, ey = world_to_px(*trail[-1])
@@ -1053,30 +1080,24 @@ def save_odom_map(trail, map_dir, outbound_trail=None, return_trail=None,
         cv2.putText(vis, 'end',   (ex+6, ey-6),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-    # ── Legend — placed dynamically in the grey (unknown) area outside the arena ──
-    # Grey pixels in the ROS pgm (value 51–229) are unknown space outside the
-    # navigable corridor. We score five candidate positions by how many grey
-    # pixels they cover and pick the one with the highest score, so the legend
-    # lands in a grey margin rather than on top of the map itself.
     legend_w   = 168
     legend_h   = 70 if (live_grid is not None) else 50
 
-    # Build a scaled binary mask: 1 where the original pgm pixel is grey
     grey_orig   = (img > 50) & (img < 230)
     grey_scaled = np.kron(grey_orig.astype(np.uint8),
                           np.ones((scale, scale), dtype=np.uint8))
     img_h_sc, img_w_sc = grey_scaled.shape
 
     candidates = [
-        (8,                    8),                               # top-left
-        (8,                    img_h_sc // 2 - legend_h // 2),  # left-centre
-        (8,                    img_h_sc - legend_h - 8),        # bottom-left
-        (img_w_sc - legend_w - 8, 8),                           # top-right
-        (img_w_sc - legend_w - 8, img_h_sc // 2 - legend_h // 2),  # right-centre
-        (img_w_sc - legend_w - 8, img_h_sc - legend_h - 8),    # bottom-right
+        (8,                    8),
+        (8,                    img_h_sc // 2 - legend_h // 2),
+        (8,                    img_h_sc - legend_h - 8),
+        (img_w_sc - legend_w - 8, 8),
+        (img_w_sc - legend_w - 8, img_h_sc // 2 - legend_h // 2),
+        (img_w_sc - legend_w - 8, img_h_sc - legend_h - 8),
     ]
 
-    lx, ly     = 8, 8   # fallback
+    lx, ly     = 8, 8
     best_score = -1
     for cx, cy in candidates:
         if cx < 0 or cy < 0 or cx + legend_w > img_w_sc or cy + legend_h > img_h_sc:

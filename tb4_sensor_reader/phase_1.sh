@@ -1,4 +1,4 @@
-# Before running this script, must run:
+# Before running this phase_1.sh, must run:
 # set-turtlebot XX (whatever number the Turtlebot is)
 # sanity && ros2 topic list (optional: to confirm that Turtlebot is connected)
 
@@ -20,13 +20,13 @@ echo "Using TurtleBot: $TB"
 
 set-turtlebot $TB_NUM
 
-sleep 1
+# sleep 1
 
-echo "Undocking..."
+# echo "Undocking..."
 
-ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
+# ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
 
-sleep 5
+sleep 3
 
 echo "Launching SLAM..."
 gnome-terminal -- bash -c "source ~/.bashrc; source ~/ros2_ws/install/setup.bash; set-turtlebot $TB_NUM; ros2 service call /$TB/reset_pose irobot_create_msgs/srv/ResetPose {}; ros2 launch turtlebot4_navigation slam.launch.py namespace:=/$TB; exec bash"
@@ -69,8 +69,8 @@ slam_toolbox/srv/SerializePoseGraph \
 
 sleep 3
 
-echo "Docking..."
-ros2 action send_goal --feedback /$TB/dock irobot_create_msgs/action/Dock "{}"
+# echo "Docking..."
+# ros2 action send_goal --feedback /$TB/dock irobot_create_msgs/action/Dock "{}"
 
 cd ~/ros2_ws/src/tb4_sensor_reader/tb4_sensor_reader
 ~/ros2_venv/bin/python3 path_planner_v2.py

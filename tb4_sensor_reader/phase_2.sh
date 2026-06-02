@@ -1,5 +1,5 @@
 #!/bin/bash
-# Before this script runs, close all Phase 1 terminals.
+# Before this phase_2.sh runs, close all Phase 1 terminals.
 # First time only: chmod +x phase_2.sh
 
 source ~/.bashrc
@@ -19,7 +19,7 @@ sleep 1
 
 echo "Undocking..."
 ros2 action send_goal /$TB/undock irobot_create_msgs/action/Undock "{}"
-sleep 5
+sleep 3
 
 echo "Resetting odometry..."
 ros2 service call /$TB/reset_pose irobot_create_msgs/srv/ResetPose {}
